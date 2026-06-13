@@ -9,6 +9,7 @@
   const error = writable('');
   const loading = writable(false);
   const theme = writable('system');
+  const excludePaladium = writable(false);
 
   const osOptions = ['MACOS', 'LINUX', 'WINDOWS'];
   const form = writable({
@@ -22,13 +23,15 @@
   const uploadForm = writable({
     model: '',
     path: '',
-    file: null
+    file: null,
+    name: ''
   });
 
   const uploadBatchForm = writable({
     model: '',
     path: '',
-    files: []
+    files: [],
+    mode: 'files'
   });
 
   const loginForm = writable({ password: '' });
@@ -130,6 +133,13 @@
         blacklistedModels.set((bl.models || []).map((item) => ({ ...item })));
         remoteModels.set((remote.models || []).map((item) => ({ ...item, os: item.os || [] })));
         remoteFiles.set(remote.files || []);
+        // load app config (exclude_paladium) after authentication
+        try {
+          const cfg = await fetchJson('/api/config');
+          excludePaladium.set(!!cfg.exclude_paladium);
+        } catch (e) {
+          console.warn('Unable to load app config:', e.message);
+        }
         auth.set(true);
         currentView.set('dashboard');
       }
@@ -204,6 +214,25 @@
       remoteFiles.set(remote.files || []);
     } catch (err) {
       console.warn('Unable to refresh remote options:', err.message);
+    }
+  }
+
+  async function setAppConfig(val) {
+    loading.set(true);
+    error.set('');
+    try {
+      const res = await fetchJson('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ exclude_paladium: !!val })
+      });
+      excludePaladium.set(!!res.exclude_paladium);
+      // refresh remote lists to reflect server-side changes
+      await refreshRemoteOptions();
+    } catch (e) {
+      error.set(e.message);
+    } finally {
+      loading.set(false);
     }
   }
 
@@ -353,6 +382,7 @@
       payload.append('model', $uploadForm.model);
       payload.append('path', $uploadForm.path || '');
       payload.append('file', $uploadForm.file);
+      if ($uploadForm.name) payload.append('name', $uploadForm.name);
       const res = await fetch('/api/files', {
         method: 'POST',
         body: payload
@@ -364,6 +394,7 @@
       files.set(await res.json());
       uploadForm.set({ model: '', path: '', file: null });
       document.querySelector('#upload-file').value = '';
+      uploadForm.update((s) => ({ ...s, name: '' }));
     } catch (e) {
       error.set(e.message);
     } finally {
@@ -503,7 +534,13 @@
       <h1>CDN Admin</h1>
       <p class="tiny">Light / dark mode is automatic. Use the toggle to cycle themes.</p>
     </div>
-    <button type="button" class="secondary" on:click={toggleTheme}>Toggle theme</button>
+    <div style="display:flex;align-items:center;gap:0.75rem;">
+      <label style="display:flex;align-items:center;gap:0.5rem;" title="When enabled, Paladium CDN files will be excluded from /manifest.json">
+        <input type="checkbox" checked={$excludePaladium} on:change={async (e) => await setAppConfig(e.target.checked)} />
+        <span class="tiny">Exclude Paladium CDN from manifest</span>
+      </label>
+      <button type="button" class="secondary" on:click={toggleTheme}>Toggle theme</button>
+    </div>
   </header>
 
   {#if $currentView === 'login'}
@@ -544,6 +581,11 @@
           <label for="upload-file">File</label>
           <input id="upload-file" type="file" on:change={(e) => uploadForm.update((s) => ({ ...s, file: e.target.files[0] }))} required />
         </div>
+        <div class="field">
+          <label for="upload-name">Name (optional)</label>
+          <input id="upload-name" type="text" placeholder="custom-name.jar (optional)" bind:value={$uploadForm.name} />
+          <div class="tiny">If left empty the original filename will be used.</div>
+        </div>
         <div class="field" style="align-self: flex-end; min-width: 180px;">
           <button type="submit" disabled={$loading}>Upload</button>
         </div>
@@ -564,8 +606,16 @@
           <input id="upload-batch-path" type="text" placeholder="mods/" value={$uploadBatchForm.path} on:input={(e) => uploadBatchForm.update((s) => ({ ...s, path: e.target.value }))} />
         </div>
         <div class="field">
-          <label for="upload-files">Files or folder</label>
-          <input id="upload-files" type="file" webkitdirectory directory multiple on:change={(e) => uploadBatchForm.update((s) => ({ ...s, files: Array.from(e.target.files) }))} />
+          <label>Selection mode</label>
+          <div class="row" style="gap: 0.75rem; align-items: center;">
+            <label><input type="radio" name="batchMode" value="files" checked={$uploadBatchForm.mode === 'files'} on:change={(e) => uploadBatchForm.update((s) => ({ ...s, mode: e.target.value, files: [] }))} /> Multiple files</label>
+            <label><input type="radio" name="batchMode" value="folder" checked={$uploadBatchForm.mode === 'folder'} on:change={(e) => uploadBatchForm.update((s) => ({ ...s, mode: e.target.value, files: [] }))} /> Folder</label>
+          </div>
+          {#if $uploadBatchForm.mode === 'files'}
+            <input id="upload-files" type="file" multiple on:change={(e) => uploadBatchForm.update((s) => ({ ...s, files: Array.from(e.target.files) }))} />
+          {:else}
+            <input id="upload-files-folder" type="file" webkitdirectory directory multiple on:change={(e) => uploadBatchForm.update((s) => ({ ...s, files: Array.from(e.target.files) }))} />
+          {/if}
           <div class="tiny">Select multiple files or a folder (folder picker supported in Chromium-based browsers).</div>
         </div>
         <div class="field" style="align-self: flex-end; min-width: 180px;">

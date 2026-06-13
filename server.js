@@ -229,6 +229,33 @@ await loadManifestCache();
 cleanupRemoteBlacklist();
 setInterval(fetchRemoteManifest, 10 * 60 * 1000);
 
+// Application-level config stored on disk
+const CONFIG_PATH = path.join(STORAGE_ROOT, 'app_config.json');
+let appConfig = { exclude_paladium: false };
+
+async function loadAppConfig() {
+  try {
+    const text = await fsPromises.readFile(CONFIG_PATH, 'utf-8');
+    const json = JSON.parse(text);
+    appConfig = { ...appConfig, ...json };
+    console.log('Loaded app config');
+  } catch (err) {
+    console.log('No app config found, using defaults');
+    await saveAppConfig();
+  }
+}
+
+async function saveAppConfig() {
+  try {
+    await fsPromises.writeFile(CONFIG_PATH, JSON.stringify(appConfig, null, 2), 'utf-8');
+    console.log('App config saved');
+  } catch (err) {
+    console.error('Unable to save app config:', err.message);
+  }
+}
+
+await loadAppConfig();
+
 app.locals.authTokens = new Set();
 
 function normalizeOs(osArray) {
@@ -414,6 +441,22 @@ app.get('/api/remote-cdn', secureAuth, (req, res) => {
   res.json({ models, files });
 });
 
+// App config endpoints
+app.get('/api/config', secureAuth, (req, res) => {
+  res.json({ exclude_paladium: !!appConfig.exclude_paladium });
+});
+
+app.post('/api/config', secureAuth, async (req, res) => {
+  const { exclude_paladium } = req.body ?? {};
+  if (typeof exclude_paladium !== 'boolean') {
+    return res.status(400).json({ error: 'exclude_paladium (boolean) is required' });
+  }
+  appConfig.exclude_paladium = exclude_paladium;
+  await saveAppConfig();
+  markManifestDirty();
+  res.json({ exclude_paladium: appConfig.exclude_paladium });
+});
+
 function getModelDefinition(modelName) {
   const row = db.prepare('SELECT dest, os FROM models WHERE name = ?').get(modelName);
   if (row) {
@@ -442,7 +485,7 @@ app.post('/api/files', secureAuth, upload.single('file'), async (req, res) => {
     const modelDefinition = getModelDefinition(modelName);
     if (!modelDefinition) return res.status(400).json({ error: 'Unknown model' });
 
-    const sanitizedRelative = safePath(relativePath || fileName);
+    const sanitizedRelative = safePath(relativePath || (req.body.name || fileName));
     const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
     const filePath = path.posix.join(modelDefinition.dest, normalizedPath);
     const fullPath = path.join(STORAGE_ROOT, filePath);
@@ -452,8 +495,9 @@ app.post('/api/files', secureAuth, upload.single('file'), async (req, res) => {
     const sha1 = crypto.createHash('sha1').update(req.file.buffer).digest('hex');
     const size = req.file.size;
     const osArray = normalizeOs(modelDefinition.os);
+    const displayName = req.body.name || fileName;
     db.prepare(`INSERT INTO files (name, model, path, size, sha1, os, uploaded_at, download_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
-      fileName,
+      displayName,
       modelName,
       filePath,
       size,
@@ -462,7 +506,7 @@ app.post('/api/files', secureAuth, upload.single('file'), async (req, res) => {
       new Date().toISOString()
     );
     markManifestDirty();
-    logger('info', 'upload_success', { model: modelName, path: filePath, name: fileName });
+    logger('info', 'upload_success', { model: modelName, path: filePath, name: displayName });
 
     const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
     const baseUrl = getManifestHost(req);
@@ -598,11 +642,19 @@ app.put('/api/files/:id', secureAuth, upload.single('file'), async (req, res) =>
 });
 
 async function buildManifest(host) {
+  const excludePaladium = !!appConfig.exclude_paladium;
   const blacklistedModelNames = new Set(getBlacklistedModels().map((item) => item.name));
   const blacklistedFileKeys = new Set(getBlacklistedFiles().map((item) => `${item.model}::${item.path}`));
+  // Always start from remote manifest for models; when exclude_paladium is set,
+  // we will remove remote files only (leave remote models present).
   const manifest = JSON.parse(JSON.stringify(remoteManifest));
   manifest.models = (manifest.models || []).filter((item) => !blacklistedModelNames.has(item.name));
-  manifest.files = (manifest.files || []).filter((item) => !blacklistedFileKeys.has(`${item.model}::${item.path}`) && !blacklistedModelNames.has(item.model));
+  if (excludePaladium) {
+    // remove remote files entirely
+    manifest.files = [];
+  } else {
+    manifest.files = (manifest.files || []).filter((item) => !blacklistedFileKeys.has(`${item.model}::${item.path}`) && !blacklistedModelNames.has(item.model));
+  }
 
   const models = db.prepare('SELECT name, version, description, dest, os FROM models ORDER BY created_at DESC').all().map((row) => ({
     name: row.name,
@@ -631,7 +683,7 @@ async function buildManifest(host) {
   manifest.files = [...manifest.files, ...filteredLocalFiles];
   const manifestText = JSON.stringify(manifest, null, 2);
   manifestCache = manifestText;
-  manifestCacheHost = host;
+  manifestCacheHost = host + `::exclude_paladium=${excludePaladium}`;
   manifestCacheDirty = false;
   await saveManifestCache(manifestText);
   return manifestText;
@@ -642,7 +694,9 @@ app.get('/manifest.json', async (req, res) => {
     await fetchRemoteManifest();
   }
   const host = getManifestHost(req);
-  if (!manifestCacheDirty && manifestCache && manifestCacheHost === host) {
+  const excludePaladium = !!appConfig.exclude_paladium;
+  const cacheKey = host + `::exclude_paladium=${excludePaladium}`;
+  if (!manifestCacheDirty && manifestCache && manifestCacheHost === cacheKey) {
     res.setHeader('Content-Type', 'application/json');
     return res.send(manifestCache);
   }
