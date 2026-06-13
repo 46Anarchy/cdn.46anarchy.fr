@@ -534,13 +534,6 @@
       <h1>CDN Admin</h1>
       <p class="tiny">Light / dark mode is automatic. Use the toggle to cycle themes.</p>
     </div>
-    <div style="display:flex;align-items:center;gap:0.75rem;">
-      <label style="display:flex;align-items:center;gap:0.5rem;" title="When enabled, Paladium CDN files will be excluded from /manifest.json">
-        <input type="checkbox" checked={$excludePaladium} on:change={async (e) => await setAppConfig(e.target.checked)} />
-        <span class="tiny">Exclude Paladium CDN from manifest</span>
-      </label>
-      <button type="button" class="secondary" on:click={toggleTheme}>Toggle theme</button>
-    </div>
   </header>
 
   {#if $currentView === 'login'}
@@ -556,6 +549,13 @@
   {:else}
     <div style="display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem;">
       <button on:click={logout} class="secondary">Logout</button>
+      <div style="display:flex;align-items:center;gap:0.75rem;">
+      <label style="display:flex;align-items:center;gap:0.5rem;" title="When enabled, Paladium CDN files will be excluded from /manifest.json">
+        <input type="checkbox" checked={$excludePaladium} on:change={async (e) => await setAppConfig(e.target.checked)} />
+        <span class="tiny">Exclude Paladium CDN from manifest</span>
+      </label>
+      <button type="button" class="secondary" on:click={toggleTheme}>Toggle theme</button>
+    </div>
       <button on:click={refreshStatus} class="secondary">Refresh data</button>
     </div>
 
