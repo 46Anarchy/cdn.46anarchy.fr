@@ -529,18 +529,20 @@ app.post('/api/files/batch', secureAuth, upload.array('files'), async (req, res)
     const modelDefinition = getModelDefinition(modelName);
     if (!modelDefinition) return res.status(400).json({ error: 'Unknown model' });
 
-    for (const file of req.files) {
-        // Prefer explicit paths[] values sent by the client (same order as files).
-        // Multer will parse text fields into req.body; paths may be a single string or array.
-        let suppliedRelative = '';
-        if (req.body && req.body['paths[]']) {
-          const pathsField = req.body['paths[]'];
-          if (Array.isArray(pathsField)) suppliedRelative = pathsField.shift() || '';
-          else suppliedRelative = pathsField || '';
-        }
-        // fallback to file.originalname when explicit path not provided
-        if (!suppliedRelative) suppliedRelative = file.originalname || '';
-        const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
+    // prefer a JSON-encoded 'paths' array sent by the client to avoid ordering issues
+    let suppliedPaths = [];
+    if (req.body && typeof req.body.paths === 'string') {
+      try {
+        const parsed = JSON.parse(req.body.paths);
+        if (Array.isArray(parsed)) suppliedPaths = parsed.slice();
+      } catch (e) {
+        // ignore parse errors
+      }
+    }
+    for (let i = 0; i < req.files.length; i++) {
+      const file = req.files[i];
+      let suppliedRelative = suppliedPaths[i] || file.originalname || '';
+      const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
       const sanitizedRelative = safePath(combined || path.posix.basename(file.originalname || ''));
       const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
       const filePath = path.posix.join(modelDefinition.dest, normalizedPath);

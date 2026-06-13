@@ -422,20 +422,33 @@
     loading.set(true);
     error.set('');
     try {
-      const { model, path: basePath, files } = $uploadBatchForm;
+      const { model, path: basePath, files, mode } = $uploadBatchForm;
       if (!model) throw new Error('model is required');
       if (!files || files.length === 0) throw new Error('no files selected');
       const payload = new FormData();
       payload.append('model', model);
       if (basePath) payload.append('path', basePath);
+      // If uploading a folder, strip the top-level selected folder name
+      let rootPrefix = '';
+      if (mode === 'folder' && files && files.length) {
+        const first = files.find((x) => x.webkitRelativePath || x.relativePath || x.name);
+        const firstRel = first ? (first.webkitRelativePath || first.relativePath || first.name) : '';
+        if (firstRel && firstRel.includes('/')) {
+          rootPrefix = firstRel.split('/')[0];
+        }
+      }
+      const paths = [];
       for (const f of files) {
-        const relative = f.webkitRelativePath || f.relativePath || f.name;
+        let relative = f.webkitRelativePath || f.relativePath || f.name;
+        if (rootPrefix && relative.startsWith(rootPrefix + '/')) {
+          relative = relative.slice(rootPrefix.length + 1);
+        }
         const normalized = (basePath ? (basePath.replace(/\/+$/, '') + '/') : '') + relative.replace(/^\/+/, '');
         payload.append('files', f, normalized);
-        // also include explicit relative path mapping to work around browsers
-        // that may strip directory components from the filename
-        payload.append('paths[]', normalized);
+        paths.push(normalized);
       }
+      // send explicit paths array as a JSON string to ensure ordering
+      payload.append('paths', JSON.stringify(paths));
       const res = await fetch('/api/files/batch', {
         method: 'POST',
         body: payload
