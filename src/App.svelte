@@ -381,7 +381,22 @@
       const payload = new FormData();
       payload.append('model', $uploadForm.model);
       payload.append('path', $uploadForm.path || '');
-      payload.append('file', $uploadForm.file);
+      // Preserve directory structure by setting the filename when appending the file.
+      // If the provided path looks like a directory (ends with / or has no dot), append the file name.
+      let supplied = String($uploadForm.path || '').trim();
+      let filenameForForm = $uploadForm.file.name;
+      if (supplied) {
+        if (supplied.endsWith('/')) {
+          filenameForForm = supplied.replace(/^\/+/, '') + $uploadForm.file.name;
+        } else if (supplied.includes('/') || supplied.includes('.')) {
+          // treat supplied as a full relative path
+          filenameForForm = supplied.replace(/^\/+/, '');
+        } else {
+          // treat as directory name
+          filenameForForm = supplied.replace(/^\/+/, '') + '/' + $uploadForm.file.name;
+        }
+      }
+      payload.append('file', $uploadForm.file, filenameForForm);
       if ($uploadForm.name) payload.append('name', $uploadForm.name);
       const res = await fetch('/api/files', {
         method: 'POST',
@@ -417,6 +432,9 @@
         const relative = f.webkitRelativePath || f.relativePath || f.name;
         const normalized = (basePath ? (basePath.replace(/\/+$/, '') + '/') : '') + relative.replace(/^\/+/, '');
         payload.append('files', f, normalized);
+        // also include explicit relative path mapping to work around browsers
+        // that may strip directory components from the filename
+        payload.append('paths[]', normalized);
       }
       const res = await fetch('/api/files/batch', {
         method: 'POST',
@@ -444,6 +462,31 @@
       applyTheme(next);
       return next;
     });
+  }
+
+  async function deleteEverything() {
+    if (!confirm('This will permanently delete files. Proceed?')) return;
+    const model = window.prompt('Enter a model name to delete only that model\'s files, or leave empty to delete everything');
+    loading.set(true);
+    error.set('');
+    try {
+      let res;
+      if (model && String(model).trim()) {
+        res = await fetchJson('/api/files/delete-model', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model: String(model).trim() })
+        });
+      } else {
+        res = await fetchJson('/api/files/delete-all', { method: 'POST' });
+      }
+      await refreshStatus();
+      alert(`Deleted ${res.removed || 0} files${res.model ? ' for model ' + res.model : ''}`);
+    } catch (e) {
+      error.set(e.message);
+    } finally {
+      loading.set(false);
+    }
   }
 </script>
 
@@ -554,9 +597,10 @@
         <input type="checkbox" checked={$excludePaladium} on:change={async (e) => await setAppConfig(e.target.checked)} />
         <span class="tiny">Exclude Paladium CDN from manifest</span>
       </label>
-      <button type="button" class="secondary" on:click={toggleTheme}>Toggle theme</button>
+        <button type="button" class="secondary" on:click={toggleTheme}>Toggle theme</button>
     </div>
-      <button on:click={refreshStatus} class="secondary">Refresh data</button>
+        <button on:click={refreshStatus} class="secondary">Refresh data</button>
+        <button on:click={async () => await deleteEverything()} class="secondary" title="Danger: delete files">Delete files</button>
     </div>
 
     {#if $error}<div class="error">{$error}</div>{/if}

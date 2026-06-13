@@ -530,9 +530,17 @@ app.post('/api/files/batch', secureAuth, upload.array('files'), async (req, res)
     if (!modelDefinition) return res.status(400).json({ error: 'Unknown model' });
 
     for (const file of req.files) {
-      // file.originalname is used to carry the relative path supplied by the browser
-      const suppliedRelative = file.originalname || '';
-      const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
+        // Prefer explicit paths[] values sent by the client (same order as files).
+        // Multer will parse text fields into req.body; paths may be a single string or array.
+        let suppliedRelative = '';
+        if (req.body && req.body['paths[]']) {
+          const pathsField = req.body['paths[]'];
+          if (Array.isArray(pathsField)) suppliedRelative = pathsField.shift() || '';
+          else suppliedRelative = pathsField || '';
+        }
+        // fallback to file.originalname when explicit path not provided
+        if (!suppliedRelative) suppliedRelative = file.originalname || '';
+        const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
       const sanitizedRelative = safePath(combined || path.posix.basename(file.originalname || ''));
       const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
       const filePath = path.posix.join(modelDefinition.dest, normalizedPath);
@@ -583,6 +591,50 @@ app.delete('/api/files/:id', secureAuth, (req, res) => {
   const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
   const baseUrl = getManifestHost(req);
   res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
+});
+
+// Dangerous: delete all files on the server (both DB entries and disk files)
+app.post('/api/files/delete-all', secureAuth, (req, res) => {
+  const rows = db.prepare('SELECT path FROM files').all();
+  let removed = 0;
+  for (const r of rows) {
+    const fullPath = path.join(STORAGE_ROOT, r.path);
+    try {
+      if (fs.existsSync(fullPath)) {
+        fs.unlinkSync(fullPath);
+        removed++;
+      }
+    } catch (e) {
+      logger('error', 'failed_delete_file', { path: r.path, error: e.message });
+    }
+  }
+  db.prepare('DELETE FROM files').run();
+  markManifestDirty();
+  logger('info', 'delete_all_files', { removed });
+  res.json({ success: true, removed });
+});
+
+// Delete all files for a specific model
+app.post('/api/files/delete-model', secureAuth, (req, res) => {
+  const { model } = req.body || {};
+  if (!model) return res.status(400).json({ error: 'model is required' });
+  const rows = db.prepare('SELECT path FROM files WHERE model = ?').all(model);
+  let removed = 0;
+  for (const r of rows) {
+    const fullPath = path.join(STORAGE_ROOT, r.path);
+    try {
+      if (fs.existsSync(fullPath)) {
+        fs.unlinkSync(fullPath);
+        removed++;
+      }
+    } catch (e) {
+      logger('error', 'failed_delete_file', { path: r.path, error: e.message });
+    }
+  }
+  db.prepare('DELETE FROM files WHERE model = ?').run(model);
+  markManifestDirty();
+  logger('info', 'delete_model_files', { model, removed });
+  res.json({ success: true, model, removed });
 });
 
 app.put('/api/files/:id', secureAuth, upload.single('file'), async (req, res) => {
