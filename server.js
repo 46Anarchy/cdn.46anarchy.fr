@@ -473,6 +473,55 @@ app.post('/api/files', secureAuth, upload.single('file'), async (req, res) => {
   }
 });
 
+// Batch upload: accept multiple files and place each into the target model destination.
+// The client should append multiple files under the field name `files` and may
+// set each file's filename to the relative path (for example using FormData.append('files', file, relativePath)).
+app.post('/api/files/batch', secureAuth, upload.array('files'), async (req, res) => {
+  const { model: modelName, path: basePath = '' } = req.body;
+  if (!req.files || !req.files.length) return res.status(400).json({ error: 'Files missing' });
+  if (!modelName) return res.status(400).json({ error: 'model is required' });
+  logger('info', 'batch_upload_attempt', { model: modelName, count: req.files.length, ip: req.ip });
+  try {
+    const modelDefinition = getModelDefinition(modelName);
+    if (!modelDefinition) return res.status(400).json({ error: 'Unknown model' });
+
+    for (const file of req.files) {
+      // file.originalname is used to carry the relative path supplied by the browser
+      const suppliedRelative = file.originalname || '';
+      const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
+      const sanitizedRelative = safePath(combined || path.posix.basename(file.originalname || ''));
+      const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
+      const filePath = path.posix.join(modelDefinition.dest, normalizedPath);
+      const fullPath = path.join(STORAGE_ROOT, filePath);
+      await fsPromises.mkdir(path.dirname(fullPath), { recursive: true });
+      await fsPromises.writeFile(fullPath, file.buffer);
+      const sha1 = crypto.createHash('sha1').update(file.buffer).digest('hex');
+      const size = file.size;
+      const osArray = normalizeOs(modelDefinition.os);
+      const name = path.posix.basename(sanitizedRelative || file.originalname || '');
+      db.prepare(`INSERT INTO files (name, model, path, size, sha1, os, uploaded_at, download_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
+        name,
+        modelName,
+        filePath,
+        size,
+        sha1,
+        JSON.stringify(osArray),
+        new Date().toISOString()
+      );
+      logger('info', 'batch_save_file', { model: modelName, path: filePath, name });
+    }
+
+    markManifestDirty();
+    logger('info', 'batch_upload_success', { model: modelName, count: req.files.length });
+    const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
+    const baseUrl = getManifestHost(req);
+    res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
+  } catch (err) {
+    logger('error', 'batch_upload_failed', { model: modelName, error: err.message });
+    res.status(500).json({ error: 'batch upload failed' });
+  }
+});
+
 app.delete('/api/files/:id', secureAuth, (req, res) => {
   const id = req.params.id;
   const file = db.prepare('SELECT path FROM files WHERE id = ?').get(id);

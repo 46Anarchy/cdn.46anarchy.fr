@@ -1,6 +1,6 @@
 # Admin CDN
 
-Remarque : ce README est vibecoded et susceptible d'être modifié.
+Remarque : ce repo entier est vibecoded et susceptible d'être modifié.
 
 Application simple Svelte + Express pour gérer les téléversements de fichiers et publier un manifeste combiné.
 

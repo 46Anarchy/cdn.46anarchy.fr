@@ -25,6 +25,12 @@
     file: null
   });
 
+  const uploadBatchForm = writable({
+    model: '',
+    path: '',
+    files: []
+  });
+
   const loginForm = writable({ password: '' });
 
   const blacklistFileForm = writable({
@@ -365,6 +371,42 @@
     }
   }
 
+  async function addFilesBatch(event) {
+    event.preventDefault();
+    loading.set(true);
+    error.set('');
+    try {
+      const { model, path: basePath, files } = $uploadBatchForm;
+      if (!model) throw new Error('model is required');
+      if (!files || files.length === 0) throw new Error('no files selected');
+      const payload = new FormData();
+      payload.append('model', model);
+      if (basePath) payload.append('path', basePath);
+      for (const f of files) {
+        const relative = f.webkitRelativePath || f.relativePath || f.name;
+        const normalized = (basePath ? (basePath.replace(/\/+$/, '') + '/') : '') + relative.replace(/^\/+/, '');
+        payload.append('files', f, normalized);
+      }
+      const res = await fetch('/api/files/batch', {
+        method: 'POST',
+        body: payload
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error || 'Batch upload failed');
+      }
+      files.set(await res.json());
+      uploadBatchForm.set({ model: '', path: '', files: [] });
+      const el = document.querySelector('#upload-files');
+      if (el) el.value = '';
+      await refreshStatus();
+    } catch (e) {
+      error.set(e.message);
+    } finally {
+      loading.set(false);
+    }
+  }
+
   function toggleTheme() {
     theme.update((value) => {
       const next = value === 'light' ? 'dark' : value === 'dark' ? 'system' : 'light';
@@ -504,6 +546,30 @@
         </div>
         <div class="field" style="align-self: flex-end; min-width: 180px;">
           <button type="submit" disabled={$loading}>Upload</button>
+        </div>
+      </form>
+
+      <form on:submit|preventDefault={addFilesBatch} class="row" style="margin-top: 1rem; border-top: 1px dashed var(--border); padding-top: 1rem;">
+        <div class="field">
+          <label for="upload-batch-model">Model (batch)</label>
+          <select id="upload-batch-model" value={$uploadBatchForm.model} on:change={(e) => uploadBatchForm.update((s) => ({ ...s, model: e.target.value }))} required>
+            <option value="">Choose a model</option>
+            {#each $models as model}
+              <option value={model.name}>{model.name}</option>
+            {/each}
+          </select>
+        </div>
+        <div class="field">
+          <label for="upload-batch-path">Base path (optional)</label>
+          <input id="upload-batch-path" type="text" placeholder="mods/" value={$uploadBatchForm.path} on:input={(e) => uploadBatchForm.update((s) => ({ ...s, path: e.target.value }))} />
+        </div>
+        <div class="field">
+          <label for="upload-files">Files or folder</label>
+          <input id="upload-files" type="file" webkitdirectory directory multiple on:change={(e) => uploadBatchForm.update((s) => ({ ...s, files: Array.from(e.target.files) }))} />
+          <div class="tiny">Select multiple files or a folder (folder picker supported in Chromium-based browsers).</div>
+        </div>
+        <div class="field" style="align-self: flex-end; min-width: 180px;">
+          <button type="submit" disabled={$loading}>Batch upload</button>
         </div>
       </form>
     </section>
