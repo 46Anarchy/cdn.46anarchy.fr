@@ -487,7 +487,13 @@ app.post('/api/files', secureAuth, upload.single('file'), async (req, res) => {
 
     const sanitizedRelative = safePath(relativePath || (req.body.name || fileName));
     const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
-    const filePath = path.posix.join(modelDefinition.dest, normalizedPath);
+    // Avoid duplicating the model destination if client already included it in the path
+    let filePath;
+    if (normalizedPath === modelDefinition.dest || normalizedPath.startsWith(modelDefinition.dest + '/')) {
+      filePath = normalizedPath;
+    } else {
+      filePath = path.posix.join(modelDefinition.dest, normalizedPath);
+    }
     const fullPath = path.join(STORAGE_ROOT, filePath);
     logger('info', 'saving_file', { fullPath });
     await fsPromises.mkdir(path.dirname(fullPath), { recursive: true });
@@ -545,7 +551,13 @@ app.post('/api/files/batch', secureAuth, upload.array('files'), async (req, res)
       const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
       const sanitizedRelative = safePath(combined || path.posix.basename(file.originalname || ''));
       const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
-      const filePath = path.posix.join(modelDefinition.dest, normalizedPath);
+      // Avoid duplicating the model destination if client already included it in the path
+      let filePath;
+      if (normalizedPath === modelDefinition.dest || normalizedPath.startsWith(modelDefinition.dest + '/')) {
+        filePath = normalizedPath;
+      } else {
+        filePath = path.posix.join(modelDefinition.dest, normalizedPath);
+      }
       const fullPath = path.join(STORAGE_ROOT, filePath);
       await fsPromises.mkdir(path.dirname(fullPath), { recursive: true });
       await fsPromises.writeFile(fullPath, file.buffer);
@@ -735,6 +747,20 @@ async function buildManifest(host) {
 
   manifest.models = [...manifest.models, ...filteredLocalModels];
   manifest.files = [...manifest.files, ...filteredLocalFiles];
+  // Normalize file.path to be relative to model.dest when possible so files
+  // don't redundantly include the model destination in the manifest.
+  const modelDestByName = new Map((manifest.models || []).map((m) => [m.name, m.dest]));
+  manifest.files = (manifest.files || []).map((f) => {
+    try {
+      const dest = modelDestByName.get(f.model);
+      if (dest && typeof f.path === 'string' && f.path.startsWith(dest + '/')) {
+        return { ...f, path: f.path.slice(dest.length + 1) };
+      }
+    } catch (e) {
+      // ignore and return original
+    }
+    return f;
+  });
   const manifestText = JSON.stringify(manifest, null, 2);
   manifestCache = manifestText;
   manifestCacheHost = host + `::exclude_paladium=${excludePaladium}`;
