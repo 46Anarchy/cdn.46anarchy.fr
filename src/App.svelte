@@ -16,6 +16,10 @@
   let upload = { model: '', path: '', file: null };
   let batchUpload = { model: '', files: [] };
   let directoryUploadProgress = null;
+  let fileSearch = '';
+  let fileSort = 'name';
+  let selectedFileModels = [];
+  let visibleFiles = [];
 
   const request = async (url, options = {}) => {
     const response = await fetch(url, options);
@@ -161,6 +165,20 @@
     catch (err) { fail(err); } finally { busy = false; }
   }
 
+  async function replaceFile(file, event) {
+    const replacement = event.currentTarget.files[0];
+    if (!replacement) return;
+    event.currentTarget.value = '';
+    busy = true;
+    try {
+      const body = new FormData();
+      body.append('file', replacement);
+      await request(`/api/files/${file.id}`, { method: 'PUT', body });
+      await load();
+      message(`${file.name} replaced.`);
+    } catch (err) { fail(err); } finally { busy = false; }
+  }
+
   async function updateConfig() {
     busy = true;
     try { config = await request('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }); message('Publishing settings saved.'); }
@@ -171,7 +189,26 @@
     modelForm = { ...modelForm, os: modelForm.os.includes(os) ? modelForm.os.filter((value) => value !== os) : [...modelForm.os, os] };
   }
 
+  function toggleFileModel(model) {
+    selectedFileModels = selectedFileModels.includes(model)
+      ? selectedFileModels.filter((name) => name !== model)
+      : [...selectedFileModels, model];
+  }
+
   const size = (bytes) => bytes < 1024 ? `${bytes} B` : bytes < 1048576 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
+
+  $: {
+    const search = fileSearch.trim().toLocaleLowerCase();
+    const selectedModels = new Set(selectedFileModels);
+    visibleFiles = files
+      .filter((file) => (!search || file.name.toLocaleLowerCase().includes(search)) && (!selectedModels.size || selectedModels.has(file.model)))
+      .slice()
+      .sort((left, right) => {
+        if (fileSort === 'size') return right.size - left.size || left.name.localeCompare(right.name);
+        if (fileSort === 'model') return left.model.localeCompare(right.model) || left.name.localeCompare(right.name);
+        return left.name.localeCompare(right.name) || left.path.localeCompare(right.path);
+      });
+  }
 </script>
 
 <svelte:head><title>CDN Console</title></svelte:head>
@@ -247,7 +284,14 @@
     </div>
 
     <section class="card library"><div class="card-heading"><div><p class="eyebrow">LIBRARY</p><h2>Uploaded files</h2></div><span class="count">{files.length}</span></div>
-      {#if files.length === 0}<div class="empty">No uploaded files yet.</div>{:else}<div class="table-wrap"><table><thead><tr><th>Name</th><th>Model</th><th>Path</th><th>Size</th><th></th></tr></thead><tbody>{#each files as file}<tr><td><a href={file.url} target="_blank" rel="noreferrer">{file.name}</a></td><td>{file.model}</td><td><code>{file.path}</code></td><td>{size(file.size)}</td><td><button class="danger" on:click={() => removeFile(file)} disabled={busy}>Delete</button></td></tr>{/each}</tbody></table></div>{/if}
+      {#if files.length === 0}<div class="empty">No uploaded files yet.</div>{:else}
+        <div class="file-library-controls">
+          <label>Search by name<input type="search" bind:value={fileSearch} placeholder="example.jar" aria-label="Search uploaded files by name" /></label>
+          <div class="model-filter"><span>Models</span><details><summary>{selectedFileModels.length === 0 ? 'All models' : selectedFileModels.length === 1 ? selectedFileModels[0] : `${selectedFileModels.length} models selected`}</summary><div class="model-options">{#each [...new Set(files.map((file) => file.model))].sort() as model}<label><input type="checkbox" checked={selectedFileModels.includes(model)} on:change={() => toggleFileModel(model)} /><span>{model}</span></label>{/each}</div></details></div>
+          <label>Sort by<select bind:value={fileSort} aria-label="Sort uploaded files"><option value="name">Name</option><option value="size">Size</option><option value="model">Model</option></select></label>
+        </div>
+        {#if visibleFiles.length === 0}<div class="empty">No uploaded files match “{fileSearch}”.</div>{:else}<div class="table-wrap"><table><thead><tr><th>Name</th><th>Model</th><th>Path</th><th>Size</th><th></th></tr></thead><tbody>{#each visibleFiles as file}<tr><td><a href={file.url} target="_blank" rel="noreferrer">{file.name}</a></td><td>{file.model}</td><td><code>{file.path}</code></td><td>{size(file.size)}</td><td class="file-actions"><button class="secondary" on:click={() => document.querySelector(`#replace-${file.id}`).click()} disabled={busy}>Replace</button><input id={`replace-${file.id}`} class="visually-hidden" type="file" on:change={(event) => replaceFile(file, event)} /><button class="danger" on:click={() => removeFile(file)} disabled={busy}>Delete</button></td></tr>{/each}</tbody></table></div>{/if}
+      {/if}
     </section>
 
     <section class="card library"><div class="card-heading"><div><p class="eyebrow">MODELS</p><h2>Model catalog</h2></div><span class="count">{models.length}</span></div>

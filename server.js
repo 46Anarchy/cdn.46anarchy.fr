@@ -270,6 +270,24 @@ app.post('/api/files', requireAuth, upload.single('file'), async (request, respo
     return response.status(201).json(publicFile(file, request));
   } catch (error) { next(error); }
 });
+app.put('/api/files/:id', requireAuth, upload.single('file'), async (request, response, next) => {
+  try {
+    if (!request.file) return response.status(400).json({ error: 'Choose a replacement file.' });
+    const index = catalog.files.findIndex((file) => file.id === request.params.id);
+    if (index < 0) return response.status(404).json({ error: 'File not found.' });
+    const existing = catalog.files[index];
+    await fs.writeFile(safeStoragePath(existing.path), request.file.buffer);
+    const file = {
+      ...existing,
+      size: request.file.size,
+      sha1: crypto.createHash('sha1').update(request.file.buffer).digest('hex'),
+      uploaded_at: new Date().toISOString()
+    };
+    catalog.files[index] = file;
+    await persist();
+    return response.json(publicFile(file, request));
+  } catch (error) { next(error); }
+});
 app.delete('/api/files/:id', requireAuth, async (request, response, next) => {
   try {
     const index = catalog.files.findIndex((file) => file.id === request.params.id);
