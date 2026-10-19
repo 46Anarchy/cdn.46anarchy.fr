@@ -1,826 +1,269 @@
-import express from 'express';
-import fs from 'fs';
-import fsPromises from 'fs/promises';
-import path from 'path';
-import os from 'os';
 import crypto from 'crypto';
-import multer from 'multer';
+import express from 'express';
 import dotenv from 'dotenv';
+import fs from 'fs/promises';
+import multer from 'multer';
+import path from 'path';
 import Database from 'better-sqlite3';
 
 dotenv.config();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
-if (!ADMIN_PASSWORD) {
-  console.error('ADMIN_PASSWORD is required in .env. Shutting down.');
-  process.exit(1);
-}
 
-const STORAGE_ROOT = process.env.DOCKER == true ? '/app/files' : path.join(process.env.PWD, 'files');
-const PORT = Number(process.env.PORT || 8080);
-const MANIFEST_BASE_URL = process.env.MANIFEST_BASE_URL ? process.env.MANIFEST_BASE_URL.replace(/\/+$/, '') : 'http://localhost:' + PORT;
 const app = express();
-// When running behind a reverse proxy (nginx, cloudflare) enable trust proxy
-// so Express correctly recognizes the original client protocol and IP.
-app.set('trust proxy', true);
-const upload = multer({ storage: multer.memoryStorage() });
+const port = Number(process.env.PORT || 8080);
+const storageRoot = path.resolve(process.env.STORAGE_ROOT || path.join(process.cwd(), 'files'));
+const dataFile = path.join(storageRoot, 'catalog.json');
+const remoteCacheFile = path.join(storageRoot, 'remote-manifest.json');
+const remoteUrl = process.env.REMOTE_MANIFEST_URL || 'https://cdn.paladium-pvp.fr/games/paladiumv2/paladium.json';
+const sessionDays = Math.max(1, Number(process.env.AUTH_SESSION_DAYS || 30));
+const sessionLifetime = sessionDays * 24 * 60 * 60 * 1000;
+const sessionSecret = process.env.SESSION_SECRET || process.env.ADMIN_PASSWORD;
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: Number(process.env.MAX_UPLOAD_BYTES || 1024 * 1024 * 1024) } });
 
-await fsPromises.mkdir(STORAGE_ROOT, { recursive: true });
-// Ensure log directory exists
-const LOG_DIR = path.join(STORAGE_ROOT, 'logs');
-await fsPromises.mkdir(LOG_DIR, { recursive: true });
-const db = new Database(path.join(STORAGE_ROOT, 'db.sqlite'));
-
-function dbInit() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS models (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL,
-      version TEXT NOT NULL,
-      description TEXT,
-      dest TEXT NOT NULL,
-      os TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS files (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      model TEXT NOT NULL,
-      path TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      sha1 TEXT NOT NULL,
-      os TEXT NOT NULL,
-      uploaded_at TEXT NOT NULL,
-      download_count INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE TABLE IF NOT EXISTS blacklist_files (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      model TEXT NOT NULL,
-      path TEXT NOT NULL,
-      name TEXT NOT NULL,
-      reason TEXT,
-      blacklisted_at TEXT NOT NULL,
-      UNIQUE(model, path)
-    );
-    CREATE TABLE IF NOT EXISTS blacklist_models (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE NOT NULL,
-      reason TEXT,
-      blacklisted_at TEXT NOT NULL
-    );
-  `);
+if (!process.env.ADMIN_PASSWORD) {
+  throw new Error('ADMIN_PASSWORD must be set. Add it to .env before starting the server.');
 }
 
-dbInit();
-
-const remoteUrl = 'https://cdn.paladium-pvp.fr/games/paladiumv2/paladium.json';
-const REMOTE_CACHE_PATH = path.join(STORAGE_ROOT, 'remote_manifest.json');
-const MANIFEST_CACHE_PATH = path.join(STORAGE_ROOT, 'manifest_cache.json');
+let catalog = { models: [], files: [], blacklist: { models: [], files: [] }, config: { exclude_paladium: false } };
 let remoteManifest = { models: [], files: [] };
-let manifestCache = null;
-let manifestCacheDirty = true;
-let manifestCacheHost = null;
 
-function safePath(value) {
-  return value.replace(/(^|[\/\\])\.\.?($|[\/\\])/g, '_').replace(/\\/g, '/');
+function normaliseOs(value) {
+  const values = Array.isArray(value) ? value : [];
+  return [...new Set(values.map((item) => String(item).toUpperCase()).filter((item) => ['WINDOWS', 'MACOS', 'LINUX'].includes(item)))];
 }
 
-async function appendLogFile(name, line) {
-  try {
-    await fsPromises.appendFile(path.join(LOG_DIR, name), line + '\n', 'utf-8');
-  } catch (err) {
-    console.error('Failed to write log file', err.message);
+function cleanPath(value) {
+  const result = String(value || '').replace(/\\/g, '/').replace(/^\/+/, '');
+  if (!result || result.split('/').some((part) => !part || part === '.' || part === '..')) throw new Error('A valid relative path is required.');
+  return result;
+}
+
+function safeStoragePath(relativePath) {
+  const fullPath = path.resolve(storageRoot, relativePath);
+  if (fullPath !== storageRoot && !fullPath.startsWith(`${storageRoot}${path.sep}`)) throw new Error('Invalid storage path.');
+  return fullPath;
+}
+
+function parseCookies(request) {
+  return Object.fromEntries(String(request.headers.cookie || '').split(';').map((value) => value.trim().split('=').map(decodeURIComponent)).filter(([key]) => key));
+}
+
+function signSession(expiresAt) {
+  const payload = String(expiresAt);
+  const signature = crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
+  return `${payload}.${signature}`;
+}
+
+function validSession(token) {
+  if (!token || !token.includes('.')) return false;
+  const [expiresAt, signature] = token.split('.');
+  const expected = crypto.createHmac('sha256', sessionSecret).update(expiresAt).digest('base64url');
+  const received = Buffer.from(signature);
+  const signed = Buffer.from(expected);
+  return received.length === signed.length && crypto.timingSafeEqual(received, signed) && Number(expiresAt) > Date.now();
+}
+
+function remember(response) {
+  const expiresAt = Date.now() + sessionLifetime;
+  response.cookie('cdn_session', signSession(expiresAt), { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', maxAge: sessionLifetime });
+}
+
+function requireAuth(request, response, next) {
+  if (validSession(parseCookies(request).cdn_session)) {
+    // Sliding expiry: regular use keeps the remembered login valid.
+    remember(response);
+    return next();
   }
+  return response.status(401).json({ error: 'Authentication required.' });
 }
 
-function logger(level, message, meta = {}) {
-  const ts = new Date().toISOString();
-  const entry = { ts, level, message, ...meta };
-  const line = JSON.stringify(entry);
-  if (level === 'error') console.error(message, meta);
-  else console.log(message, meta);
-  // fire-and-forget
-  appendLogFile('server.log', line);
-  if (level === 'error') appendLogFile('error.log', line);
+function publicFile(file, request) {
+  const host = process.env.MANIFEST_BASE_URL || `${request.protocol}://${request.get('host')}`;
+  return { ...file, url: `${host.replace(/\/$/, '')}/files/${encodeURI(file.path)}` };
 }
 
-async function loadRemoteManifestCache() {
+// Remote model definitions are useful on their own: they define the destination
+// and supported platforms for local files, even when remote artifacts are off.
+function availableModels() {
+  const blocked = new Set(catalog.blacklist.models.map((item) => item.name));
+  const models = new Map();
+  for (const model of remoteManifest.models) {
+    models.set(model.name, { ...model, os: normaliseOs(model.os), source: 'paladium', excluded: blocked.has(model.name) });
+  }
+  for (const model of catalog.models) {
+    models.set(model.name, { ...model, os: normaliseOs(model.os), source: 'local', excluded: blocked.has(model.name) });
+  }
+  return [...models.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+async function persist() {
+  const staging = `${dataFile}.tmp`;
+  await fs.writeFile(staging, JSON.stringify(catalog, null, 2));
+  await fs.rename(staging, dataFile);
+}
+
+async function initialise() {
+  await fs.mkdir(storageRoot, { recursive: true });
   try {
-    const cacheText = await fsPromises.readFile(REMOTE_CACHE_PATH, 'utf-8');
-    const json = JSON.parse(cacheText);
-    remoteManifest = {
-      ...json,
-      models: Array.isArray(json.models) ? json.models : [],
-      files: Array.isArray(json.files) ? json.files : []
+    const parsed = JSON.parse(await fs.readFile(dataFile, 'utf8'));
+    catalog = {
+      models: Array.isArray(parsed.models) ? parsed.models : [],
+      files: Array.isArray(parsed.files) ? parsed.files : [],
+      blacklist: { models: Array.isArray(parsed.blacklist?.models) ? parsed.blacklist.models : [], files: Array.isArray(parsed.blacklist?.files) ? parsed.blacklist.files : [] },
+      config: { exclude_paladium: Boolean(parsed.config?.exclude_paladium) }
     };
-    console.log('Loaded remote manifest from cache');
-  } catch (err) {
-    console.log('No remote manifest cache found, fetching fresh manifest.');
-    await fetchRemoteManifest();
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await migrateLegacyCatalog();
+    await persist();
   }
+  try { remoteManifest = JSON.parse(await fs.readFile(remoteCacheFile, 'utf8')); } catch (_) { /* first start */ }
 }
 
-async function saveRemoteManifestCache() {
+// Earlier releases used SQLite. Import it once when catalog.json does not exist,
+// so an upgrade keeps the published files and their metadata intact.
+async function migrateLegacyCatalog() {
+  const legacyPath = path.join(storageRoot, 'db.sqlite');
   try {
-    await fsPromises.writeFile(REMOTE_CACHE_PATH, JSON.stringify(remoteManifest, null, 2), 'utf-8');
-    console.log('Remote manifest cache saved');
-  } catch (err) {
-    console.error('Unable to save remote manifest cache:', err.message);
+    await fs.access(legacyPath);
+    const database = new Database(legacyPath, { readonly: true });
+    const models = database.prepare('SELECT name, version, description, dest, os, created_at FROM models').all();
+    const files = database.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at FROM files').all();
+    catalog.models = models.map((model) => ({ ...model, os: normaliseOs(JSON.parse(model.os || '[]')) }));
+    catalog.files = files.map((file) => ({ ...file, id: String(file.id), os: normaliseOs(JSON.parse(file.os || '[]')) }));
+    database.close();
+    console.log(`Migrated ${models.length} models and ${files.length} files from SQLite.`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') console.warn(`Legacy catalog migration skipped: ${error.message}`);
   }
 }
 
-async function loadManifestCache() {
+async function refreshRemoteManifest() {
   try {
-    manifestCache = await fsPromises.readFile(MANIFEST_CACHE_PATH, 'utf-8');
-    manifestCacheDirty = false;
-    console.log('Loaded manifest cache');
-  } catch (err) {
-    manifestCache = null;
-    manifestCacheDirty = true;
+    const response = await fetch(remoteUrl, { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) throw new Error(`upstream returned ${response.status}`);
+    const manifest = await response.json();
+    remoteManifest = { ...manifest, models: Array.isArray(manifest.models) ? manifest.models : [], files: Array.isArray(manifest.files) ? manifest.files : [] };
+    await fs.writeFile(remoteCacheFile, JSON.stringify(remoteManifest));
+  } catch (error) {
+    console.warn(`Remote manifest refresh failed: ${error.message}`);
   }
 }
 
-async function saveManifestCache(content) {
+function mergedManifest(request) {
+  const blockedModels = new Set(catalog.blacklist.models.map((item) => item.name));
+  const blockedFiles = new Set(catalog.blacklist.files.map((item) => `${item.model}:${item.path}`));
+  const remoteModels = remoteManifest.models.filter((model) => !blockedModels.has(model.name));
+  const remoteFiles = catalog.config.exclude_paladium ? [] : remoteManifest.files.filter((file) => !blockedModels.has(file.model) && !blockedFiles.has(`${file.model}:${file.path}`));
+  const localModels = catalog.models.filter((model) => !blockedModels.has(model.name));
+  const localFiles = catalog.files.filter((file) => !blockedModels.has(file.model) && !blockedFiles.has(`${file.model}:${file.path}`)).map((file) => publicFile(file, request));
+  return { ...remoteManifest, models: [...remoteModels, ...localModels], files: [...remoteFiles, ...localFiles] };
+}
+
+app.set('trust proxy', true);
+app.use(express.json({ limit: '100kb' }));
+
+app.post('/api/login', (request, response) => {
+  const supplied = Buffer.from(String(request.body?.password || ''));
+  const expected = Buffer.from(process.env.ADMIN_PASSWORD);
+  if (supplied.length !== expected.length || !crypto.timingSafeEqual(supplied, expected)) {
+    return response.status(401).json({ error: 'Invalid password.' });
+  }
+  remember(response);
+  return response.json({ success: true });
+});
+app.post('/api/logout', (_request, response) => { response.clearCookie('cdn_session'); response.json({ success: true }); });
+
+app.get('/api/models', requireAuth, (_request, response) => response.json(availableModels()));
+app.post('/api/models', requireAuth, async (request, response, next) => {
   try {
-    await fsPromises.writeFile(MANIFEST_CACHE_PATH, content, 'utf-8');
-    console.log('Manifest cache saved');
-  } catch (err) {
-    console.error('Unable to save manifest cache:', err.message);
-  }
-}
-
-function markManifestDirty() {
-  manifestCacheDirty = true;
-}
-
-function getManifestHost(req) {
-  return MANIFEST_BASE_URL;
-}
-
-function getBlacklistedFiles() {
-  return db.prepare('SELECT id, model, path, name, reason, blacklisted_at FROM blacklist_files ORDER BY blacklisted_at DESC').all();
-}
-
-function getBlacklistedModels() {
-  return db.prepare('SELECT id, name, reason, blacklisted_at FROM blacklist_models ORDER BY blacklisted_at DESC').all();
-}
-
-function remoteFileExists(model, pathValue) {
-  return (remoteManifest.files || []).some((item) => item.model === model && item.path === pathValue);
-}
-
-function remoteModelExists(name) {
-  return (remoteManifest.models || []).some((item) => item.name === name);
-}
-
-function cleanupRemoteBlacklist() {
-  const fileDeletes = db.prepare('DELETE FROM blacklist_files WHERE id = ?');
-  const modelDeletes = db.prepare('DELETE FROM blacklist_models WHERE id = ?');
-  const blacklistedFiles = getBlacklistedFiles();
-  const blacklistedModels = getBlacklistedModels();
-  let removed = false;
-
-  for (const item of blacklistedFiles) {
-    // Remove blacklist entries only if the file no longer exists in remote manifest
-    // AND it does not exist as a locally uploaded file.
-    const existsRemote = remoteFileExists(item.model, item.path);
-    const existsLocal = !!db.prepare('SELECT id FROM files WHERE model = ? AND path = ?').get(item.model, item.path);
-    if (!existsRemote && !existsLocal) {
-      const info = fileDeletes.run(item.id);
-      if (info.changes) removed = true;
-    }
-  }
-  for (const item of blacklistedModels) {
-    // Remove blacklist entries only if the model no longer exists in remote manifest
-    // AND it does not exist as a locally created model.
-    const existsRemote = remoteModelExists(item.name);
-    const existsLocal = !!db.prepare('SELECT name FROM models WHERE name = ?').get(item.name);
-    if (!existsRemote && !existsLocal) {
-      const info = modelDeletes.run(item.id);
-      if (info.changes) removed = true;
-    }
-  }
-
-  if (removed) {
-    markManifestDirty();
-  }
-}
-
-async function fetchRemoteManifest() {
+    const name = String(request.body?.name || '').trim();
+    const version = String(request.body?.version || '').trim();
+    const dest = cleanPath(request.body?.dest);
+    if (!name || !version) return response.status(400).json({ error: 'Name and version are required.' });
+    if (availableModels().some((model) => model.name === name)) return response.status(409).json({ error: 'A model with this name already exists.' });
+    const model = { name, version, dest, description: String(request.body?.description || '').trim(), os: normaliseOs(request.body?.os), created_at: new Date().toISOString() };
+    catalog.models.push(model); await persist(); return response.status(201).json(model);
+  } catch (error) { next(error); }
+});
+app.put('/api/models/:name', requireAuth, async (request, response, next) => {
   try {
-    const response = await fetch(remoteUrl, { cache: 'no-store' });
-    if (!response.ok) throw new Error(`fetch failed ${response.status}`);
-    const json = await response.json();
-    remoteManifest = {
-      ...json,
-      models: Array.isArray(json.models) ? json.models : [],
-      files: Array.isArray(json.files) ? json.files : []
-    };
-    await saveRemoteManifestCache();
-    cleanupRemoteBlacklist();
-    markManifestDirty();
-    console.log('Remote manifest loaded');
-  } catch (err) {
-    console.error('Could not fetch remote manifest:', err.message);
-  }
-}
-
-await loadRemoteManifestCache();
-await loadManifestCache();
-cleanupRemoteBlacklist();
-setInterval(fetchRemoteManifest, 10 * 60 * 1000);
-
-// Application-level config stored on disk
-const CONFIG_PATH = path.join(STORAGE_ROOT, 'app_config.json');
-let appConfig = { exclude_paladium: false };
-
-async function loadAppConfig() {
+    const model = catalog.models.find((item) => item.name === request.params.name);
+    if (!model) return response.status(404).json({ error: 'Only locally managed models can be edited.' });
+    const version = String(request.body?.version || '').trim();
+    if (!version) return response.status(400).json({ error: 'Version is required.' });
+    model.version = version;
+    model.dest = cleanPath(request.body?.dest);
+    model.description = String(request.body?.description || '').trim();
+    model.os = normaliseOs(request.body?.os);
+    await persist(); return response.json({ ...model, source: 'local' });
+  } catch (error) { next(error); }
+});
+app.patch('/api/models/:name/excluded', requireAuth, async (request, response, next) => {
   try {
-    const text = await fsPromises.readFile(CONFIG_PATH, 'utf-8');
-    const json = JSON.parse(text);
-    appConfig = { ...appConfig, ...json };
-    console.log('Loaded app config');
-  } catch (err) {
-    console.log('No app config found, using defaults');
-    await saveAppConfig();
-  }
-}
-
-async function saveAppConfig() {
+    if (typeof request.body?.excluded !== 'boolean') return response.status(400).json({ error: 'excluded must be a boolean.' });
+    const model = availableModels().find((item) => item.name === request.params.name);
+    if (!model) return response.status(404).json({ error: 'Model not found.' });
+    const index = catalog.blacklist.models.findIndex((item) => item.name === model.name);
+    if (request.body.excluded && index < 0) catalog.blacklist.models.push({ name: model.name, reason: 'Excluded in console' });
+    if (!request.body.excluded && index >= 0) catalog.blacklist.models.splice(index, 1);
+    await persist(); return response.json({ success: true });
+  } catch (error) { next(error); }
+});
+app.delete('/api/models/:name', requireAuth, async (request, response, next) => {
   try {
-    await fsPromises.writeFile(CONFIG_PATH, JSON.stringify(appConfig, null, 2), 'utf-8');
-    console.log('App config saved');
-  } catch (err) {
-    console.error('Unable to save app config:', err.message);
-  }
-}
-
-await loadAppConfig();
-
-app.locals.authTokens = new Set();
-
-function normalizeOs(osArray) {
-  if (!Array.isArray(osArray)) return [];
-  const unique = Array.from(new Set(osArray.map((item) => String(item).toUpperCase())));
-  return unique.filter((value) => ['MACOS', 'LINUX', 'WINDOWS'].includes(value));
-}
-
-function secureAuth(req, res, next) {
-  const token = req.cookies?.auth_token;
-  if (!token || !req.app.locals.authTokens.has(token)) {
-    return res.status(401).json({ error: 'unauthenticated' });
-  }
-  next();
-}
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use((req, res, next) => {
-  res.setHeader('Cache-Control', 'no-store');
-  next();
+    const index = catalog.models.findIndex((item) => item.name === request.params.name);
+    if (index < 0) return response.status(404).json({ error: 'Only locally managed models can be deleted.' });
+    const [model] = catalog.models.splice(index, 1);
+    const affectedFiles = catalog.files.filter((file) => file.model === model.name);
+    catalog.files = catalog.files.filter((file) => file.model !== model.name);
+    catalog.blacklist.models = catalog.blacklist.models.filter((item) => item.name !== model.name);
+    await Promise.all(affectedFiles.map((file) => fs.unlink(safeStoragePath(file.path)).catch((error) => { if (error.code !== 'ENOENT') throw error; })));
+    await persist(); return response.json({ success: true, deletedFiles: affectedFiles.length });
+  } catch (error) { next(error); }
 });
 
-// Request logging middleware
-app.use((req, res, next) => {
-  const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  const contentType = req.headers['content-type'] || '';
-  const contentLength = req.headers['content-length'] || ''; 
-  logger('info', 'request', { method: req.method, url: req.originalUrl, ip, contentType, contentLength });
-  next();
-});
-
-import cookieParser from 'cookie-parser';
-app.use(cookieParser());
-
-app.post('/api/login', (req, res) => {
-  const { password } = req.body;
-  if (!password || password !== ADMIN_PASSWORD) {
-    return res.status(401).json({ error: 'unauthenticated' });
-  }
-  const token = crypto.randomBytes(32).toString('hex');
-  req.app.locals.authTokens.add(token);
-  res.cookie('auth_token', token, {
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: false,
-    maxAge: 1000 * 60 * 60 * 24
-  });
-  res.json({ success: true });
-});
-
-app.post('/api/logout', secureAuth, (req, res) => {
-  const token = req.cookies?.auth_token;
-  if (token) {
-    req.app.locals.authTokens.delete(token);
-  }
-  res.clearCookie('auth_token');
-  res.json({ success: true });
-});
-
-app.get('/api/models', secureAuth, (req, res) => {
-  const rows = db.prepare('SELECT name, version, description, dest, os, created_at FROM models ORDER BY created_at DESC').all();
-  const blacklistedModelNames = new Set(getBlacklistedModels().map((item) => item.name));
-  const localModels = rows.map((row) => ({
-    ...row,
-    os: JSON.parse(row.os),
-    source: 'local',
-    blacklisted: blacklistedModelNames.has(row.name)
-  }));
-  const remoteModels = (remoteManifest.models || []).map((model) => ({
-    ...model,
-    os: normalizeOs(model.os),
-    source: 'remote',
-    blacklisted: blacklistedModelNames.has(model.name)
-  }));
-  res.json([...remoteModels, ...localModels]);
-});
-
-app.post('/api/models', secureAuth, (req, res) => {
-  const { name, version, description, dest, os: osRaw } = req.body;
-  if (!name || !version || !dest) {
-    return res.status(400).json({ error: 'name, version and dest are required' });
-  }
-  const osArray = normalizeOs(osRaw);
-  const stmt = db.prepare(`INSERT OR IGNORE INTO models (name, version, description, dest, os, created_at) VALUES (?, ?, ?, ?, ?, ?)`);
-  const info = stmt.run(name, version, description || '', dest, JSON.stringify(osArray), new Date().toISOString());
-  if (!info.changes) {
-    return res.status(400).json({ error: 'A model with this name already exists' });
-  }
-  markManifestDirty();
-  const rows = db.prepare('SELECT name, version, description, dest, os, created_at FROM models ORDER BY created_at DESC').all();
-  res.json({ models: rows.map((row) => ({ ...row, os: JSON.parse(row.os) })) });
-});
-
-app.get('/api/files', secureAuth, (req, res) => {
-  const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
-  const baseUrl = getManifestHost(req);
-  res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
-});
-
-app.get('/api/blacklist', secureAuth, (req, res) => {
-  res.json({ files: getBlacklistedFiles(), models: getBlacklistedModels() });
-});
-
-app.post('/api/blacklist/files', secureAuth, (req, res) => {
-  const { model, path: filePath, reason = '' } = req.body;
-  if (!model || !filePath) {
-    return res.status(400).json({ error: 'model and path are required' });
-  }
-  // Allow blacklisting of remote files or locally uploaded files.
-  const remoteFile = (remoteManifest.files || []).find((item) => item.model === model && item.path === filePath);
-  const localFile = db.prepare('SELECT name FROM files WHERE model = ? AND path = ?').get(model, filePath);
-  if (!remoteFile && !localFile) {
-    return res.status(400).json({ error: 'Specified file could not be found in CDN cache or local uploads' });
-  }
-  const displayName = remoteFile?.name || localFile?.name || '';
-  const stmt = db.prepare('INSERT OR IGNORE INTO blacklist_files (model, path, name, reason, blacklisted_at) VALUES (?, ?, ?, ?, ?)');
-  const info = stmt.run(model, filePath, displayName, reason, new Date().toISOString());
-  if (!info.changes) {
-    return res.status(400).json({ error: 'File is already blacklisted' });
-  }
-  markManifestDirty();
-  logger('info', 'blacklist_file_added', { model, path: filePath, name: displayName, reason });
-  res.json(getBlacklistedFiles());
-});
-
-app.delete('/api/blacklist/files/:id', secureAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM blacklist_files WHERE id = ?').run(req.params.id);
-  if (!info.changes) {
-    return res.status(404).json({ error: 'Blacklisted file not found' });
-  }
-  markManifestDirty();
-  logger('info', 'blacklist_file_removed', { id: req.params.id });
-  res.json({ success: true });
-});
-
-app.post('/api/blacklist/models', secureAuth, (req, res) => {
-  const { name, reason = '' } = req.body;
-  if (!name) {
-    return res.status(400).json({ error: 'name is required' });
-  }
-  // Allow blacklisting of remote models or locally created models.
-  const existsRemote = remoteModelExists(name);
-  const existsLocal = !!db.prepare('SELECT name FROM models WHERE name = ?').get(name);
-  if (!existsRemote && !existsLocal) {
-    return res.status(400).json({ error: 'Specified model could not be found in CDN cache or local models' });
-  }
-  const stmt = db.prepare('INSERT OR IGNORE INTO blacklist_models (name, reason, blacklisted_at) VALUES (?, ?, ?)');
-  const info = stmt.run(name, reason, new Date().toISOString());
-  if (!info.changes) {
-    return res.status(400).json({ error: 'Model is already blacklisted' });
-  }
-  markManifestDirty();
-  logger('info', 'blacklist_model_added', { name, reason });
-  res.json(getBlacklistedModels());
-});
-
-app.delete('/api/blacklist/models/:id', secureAuth, (req, res) => {
-  const info = db.prepare('DELETE FROM blacklist_models WHERE id = ?').run(req.params.id);
-  if (!info.changes) {
-    return res.status(404).json({ error: 'Blacklisted model not found' });
-  }
-  markManifestDirty();
-  logger('info', 'blacklist_model_removed', { id: req.params.id });
-  res.json({ success: true });
-});
-
-app.get('/api/remote-cdn', secureAuth, (req, res) => {
-  const blacklistedModelNames = new Set(getBlacklistedModels().map((item) => item.name));
-  const blacklistedFileKeys = new Set(getBlacklistedFiles().map((item) => `${item.model}::${item.path}`));
-  const models = (remoteManifest.models || [])
-    .filter((item) => !blacklistedModelNames.has(item.name))
-    .map((model) => ({
-      ...model,
-      os: normalizeOs(model.os)
-    }));
-  const files = (remoteManifest.files || [])
-    .filter((item) => !blacklistedFileKeys.has(`${item.model}::${item.path}`) && !blacklistedModelNames.has(item.model))
-    .map((file) => ({
-      ...file,
-      os: normalizeOs(file.os)
-    }));
-  res.json({ models, files });
-});
-
-// App config endpoints
-app.get('/api/config', secureAuth, (req, res) => {
-  res.json({ exclude_paladium: !!appConfig.exclude_paladium });
-});
-
-app.post('/api/config', secureAuth, async (req, res) => {
-  const { exclude_paladium } = req.body ?? {};
-  if (typeof exclude_paladium !== 'boolean') {
-    return res.status(400).json({ error: 'exclude_paladium (boolean) is required' });
-  }
-  appConfig.exclude_paladium = exclude_paladium;
-  await saveAppConfig();
-  markManifestDirty();
-  res.json({ exclude_paladium: appConfig.exclude_paladium });
-});
-
-function getModelDefinition(modelName) {
-  const row = db.prepare('SELECT dest, os FROM models WHERE name = ?').get(modelName);
-  if (row) {
-    return {
-      dest: row.dest,
-      os: normalizeOs(JSON.parse(row.os))
-    };
-  }
-  const remoteModel = (remoteManifest.models || []).find((item) => item.name === modelName);
-  if (remoteModel) {
-    return {
-      dest: remoteModel.dest,
-      os: normalizeOs(remoteModel.os)
-    };
-  }
-  return null;
-}
-
-app.post('/api/files', secureAuth, upload.single('file'), async (req, res) => {
-  const { model: modelName, path: relativePath = '' } = req.body;
-  if (!req.file) return res.status(400).json({ error: 'File missing' });
-  if (!modelName) return res.status(400).json({ error: 'model is required' });
-  const fileName = req.file.originalname;
-  logger('info', 'upload_attempt', { model: modelName, fileName, size: req.file.size, ip: req.ip });
+app.get('/api/files', requireAuth, (request, response) => response.json(catalog.files.slice().sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at)).map((file) => publicFile(file, request))));
+app.post('/api/files', requireAuth, upload.single('file'), async (request, response, next) => {
   try {
-    const modelDefinition = getModelDefinition(modelName);
-    if (!modelDefinition) return res.status(400).json({ error: 'Unknown model' });
-
-    const sanitizedRelative = safePath(relativePath || (req.body.name || fileName));
-    const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
-    // Avoid duplicating the model destination if client already included it in the path
-    let filePath;
-    if (normalizedPath === modelDefinition.dest || normalizedPath.startsWith(modelDefinition.dest + '/')) {
-      filePath = normalizedPath;
-    } else {
-      filePath = path.posix.join(modelDefinition.dest, normalizedPath);
-    }
-    const fullPath = path.join(STORAGE_ROOT, filePath);
-    logger('info', 'saving_file', { fullPath });
-    await fsPromises.mkdir(path.dirname(fullPath), { recursive: true });
-    await fsPromises.writeFile(fullPath, req.file.buffer);
-    const sha1 = crypto.createHash('sha1').update(req.file.buffer).digest('hex');
-    const size = req.file.size;
-    const osArray = normalizeOs(modelDefinition.os);
-    const displayName = req.body.name || fileName;
-    db.prepare(`INSERT INTO files (name, model, path, size, sha1, os, uploaded_at, download_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
-      displayName,
-      modelName,
-      filePath,
-      size,
-      sha1,
-      JSON.stringify(osArray),
-      new Date().toISOString()
-    );
-    markManifestDirty();
-    logger('info', 'upload_success', { model: modelName, path: filePath, name: displayName });
-
-    const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
-    const baseUrl = getManifestHost(req);
-    res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
-  } catch (err) {
-    logger('error', 'upload_failed', { model: modelName, fileName, error: err.message });
-    res.status(500).json({ error: 'upload failed' });
-  }
+    if (!request.file) return response.status(400).json({ error: 'Choose a file to upload.' });
+    const model = availableModels().find((item) => item.name === request.body.model);
+    if (!model) return response.status(400).json({ error: 'Choose an existing model.' });
+    const relative = request.body.path ? cleanPath(request.body.path) : cleanPath(request.file.originalname);
+    const filePath = cleanPath(path.posix.join(model.dest, relative));
+    const destination = safeStoragePath(filePath);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, request.file.buffer);
+    const previous = catalog.files.findIndex((item) => item.model === model.name && item.path === filePath);
+    if (previous >= 0) catalog.files.splice(previous, 1);
+    const file = { id: crypto.randomUUID(), name: path.posix.basename(relative), model: model.name, path: filePath, size: request.file.size, sha1: crypto.createHash('sha1').update(request.file.buffer).digest('hex'), os: model.os, uploaded_at: new Date().toISOString() };
+    catalog.files.push(file); await persist(); return response.status(201).json(publicFile(file, request));
+  } catch (error) { next(error); }
 });
-
-// Batch upload: accept multiple files and place each into the target model destination.
-// The client should append multiple files under the field name `files` and may
-// set each file's filename to the relative path (for example using FormData.append('files', file, relativePath)).
-app.post('/api/files/batch', secureAuth, upload.array('files'), async (req, res) => {
-  const { model: modelName, path: basePath = '' } = req.body;
-  if (!req.files || !req.files.length) return res.status(400).json({ error: 'Files missing' });
-  if (!modelName) return res.status(400).json({ error: 'model is required' });
-  logger('info', 'batch_upload_attempt', { model: modelName, count: req.files.length, ip: req.ip });
+app.delete('/api/files/:id', requireAuth, async (request, response, next) => {
   try {
-    const modelDefinition = getModelDefinition(modelName);
-    if (!modelDefinition) return res.status(400).json({ error: 'Unknown model' });
-
-    // prefer a JSON-encoded 'paths' array sent by the client to avoid ordering issues
-    let suppliedPaths = [];
-    if (req.body && typeof req.body.paths === 'string') {
-      try {
-        const parsed = JSON.parse(req.body.paths);
-        if (Array.isArray(parsed)) suppliedPaths = parsed.slice();
-      } catch (e) {
-        // ignore parse errors
-      }
-    }
-    for (let i = 0; i < req.files.length; i++) {
-      const file = req.files[i];
-      let suppliedRelative = suppliedPaths[i] || file.originalname || '';
-      const combined = path.posix.join(basePath || '', suppliedRelative || path.posix.basename(suppliedRelative || file.originalname || ''));
-      const sanitizedRelative = safePath(combined || path.posix.basename(file.originalname || ''));
-      const normalizedPath = sanitizedRelative.replace(/^\/+/, '');
-      // Avoid duplicating the model destination if client already included it in the path
-      let filePath;
-      if (normalizedPath === modelDefinition.dest || normalizedPath.startsWith(modelDefinition.dest + '/')) {
-        filePath = normalizedPath;
-      } else {
-        filePath = path.posix.join(modelDefinition.dest, normalizedPath);
-      }
-      const fullPath = path.join(STORAGE_ROOT, filePath);
-      await fsPromises.mkdir(path.dirname(fullPath), { recursive: true });
-      await fsPromises.writeFile(fullPath, file.buffer);
-      const sha1 = crypto.createHash('sha1').update(file.buffer).digest('hex');
-      const size = file.size;
-      const osArray = normalizeOs(modelDefinition.os);
-      const name = path.posix.basename(sanitizedRelative || file.originalname || '');
-      db.prepare(`INSERT INTO files (name, model, path, size, sha1, os, uploaded_at, download_count) VALUES (?, ?, ?, ?, ?, ?, ?, 0)`).run(
-        name,
-        modelName,
-        filePath,
-        size,
-        sha1,
-        JSON.stringify(osArray),
-        new Date().toISOString()
-      );
-      logger('info', 'batch_save_file', { model: modelName, path: filePath, name });
-    }
-
-    markManifestDirty();
-    logger('info', 'batch_upload_success', { model: modelName, count: req.files.length });
-    const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
-    const baseUrl = getManifestHost(req);
-    res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
-  } catch (err) {
-    logger('error', 'batch_upload_failed', { model: modelName, error: err.message });
-    res.status(500).json({ error: 'batch upload failed' });
-  }
+    const index = catalog.files.findIndex((file) => file.id === request.params.id);
+    if (index < 0) return response.status(404).json({ error: 'File not found.' });
+    const [file] = catalog.files.splice(index, 1);
+    await fs.unlink(safeStoragePath(file.path)).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+    await persist(); return response.json({ success: true });
+  } catch (error) { next(error); }
 });
 
-app.delete('/api/files/:id', secureAuth, (req, res) => {
-  const id = req.params.id;
-  const file = db.prepare('SELECT path FROM files WHERE id = ?').get(id);
-  if (!file) {
-    logger('error', 'delete_file_not_found', { id });
-    return res.status(404).json({ error: 'File not found' });
-  }
-  const fullPath = path.join(STORAGE_ROOT, file.path);
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
-  }
-  db.prepare('DELETE FROM files WHERE id = ?').run(id);
-  markManifestDirty();
-  logger('info', 'file_deleted', { id, path: file.path });
-  const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
-  const baseUrl = getManifestHost(req);
-  res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
-});
-
-// Dangerous: delete all files on the server (both DB entries and disk files)
-app.post('/api/files/delete-all', secureAuth, (req, res) => {
-  const rows = db.prepare('SELECT path FROM files').all();
-  let removed = 0;
-  for (const r of rows) {
-    const fullPath = path.join(STORAGE_ROOT, r.path);
-    try {
-      if (fs.existsSync(fullPath)) {
-        fs.unlinkSync(fullPath);
-        removed++;
-      }
-    } catch (e) {
-      logger('error', 'failed_delete_file', { path: r.path, error: e.message });
-    }
-  }
-  db.prepare('DELETE FROM files').run();
-  markManifestDirty();
-  logger('info', 'delete_all_files', { removed });
-  res.json({ success: true, removed });
-});
-
-// Delete all files for a specific model
-app.post('/api/files/delete-model', secureAuth, (req, res) => {
-  const { model } = req.body || {};
-  if (!model) return res.status(400).json({ error: 'model is required' });
-  const rows = db.prepare('SELECT path FROM files WHERE model = ?').all(model);
-  let removed = 0;
-  for (const r of rows) {
-    const fullPath = path.join(STORAGE_ROOT, r.path);
-    try {
-      if (fs.existsSync(fullPath)) {
-        fs.unlinkSync(fullPath);
-        removed++;
-      }
-    } catch (e) {
-      logger('error', 'failed_delete_file', { path: r.path, error: e.message });
-    }
-  }
-  db.prepare('DELETE FROM files WHERE model = ?').run(model);
-  markManifestDirty();
-  logger('info', 'delete_model_files', { model, removed });
-  res.json({ success: true, model, removed });
-});
-
-app.put('/api/files/:id', secureAuth, upload.single('file'), async (req, res) => {
-  const id = req.params.id;
-  const existing = db.prepare('SELECT * FROM files WHERE id = ?').get(id);
-  if (!existing) {
-    logger('error', 'edit_file_not_found', { id });
-    return res.status(404).json({ error: 'File not found' });
-  }
-
-  const updatedModel = req.body.model || existing.model;
-  const updatedName = req.body.name || existing.name;
-  const requestedPath = typeof req.body.path === 'string' ? req.body.path : '';
-  const modelDefinition = getModelDefinition(updatedModel);
-  if (!modelDefinition) {
-    return res.status(400).json({ error: 'Unknown model' });
-  }
-
-  const oldModelDefinition = getModelDefinition(existing.model);
-  let existingRelative = path.posix.basename(existing.path);
-  if (oldModelDefinition && existing.path.startsWith(`${oldModelDefinition.dest}/`)) {
-    existingRelative = existing.path.slice(oldModelDefinition.dest.length + 1);
-  }
-
-  const sanitizedRelative = safePath(requestedPath || existingRelative);
-  const normalizedRelative = sanitizedRelative.replace(/^\/+/, '');
-  const filePath = path.posix.join(modelDefinition.dest, normalizedRelative);
-  const fullPath = path.join(STORAGE_ROOT, filePath);
-  await fsPromises.mkdir(path.dirname(fullPath), { recursive: true });
-
-  let size = existing.size;
-  let sha1 = existing.sha1;
-  if (req.file) {
-    await fsPromises.writeFile(fullPath, req.file.buffer);
-    size = req.file.size;
-    sha1 = crypto.createHash('sha1').update(req.file.buffer).digest('hex');
-  } else if (filePath !== existing.path) {
-    const oldFull = path.join(STORAGE_ROOT, existing.path);
-    if (!fs.existsSync(oldFull)) {
-      return res.status(404).json({ error: 'Original file content not found' });
-    }
-    if (fs.existsSync(fullPath)) {
-      await fsPromises.unlink(fullPath);
-    }
-    await fsPromises.rename(oldFull, fullPath);
-  }
-
-  const osArray = normalizeOs(modelDefinition.os);
-  db.prepare('UPDATE files SET name = ?, model = ?, path = ?, size = ?, sha1 = ?, os = ?, uploaded_at = ? WHERE id = ?')
-    .run(updatedName, updatedModel, filePath, size, sha1, JSON.stringify(osArray), new Date().toISOString(), id);
-  markManifestDirty();
-  logger('info', 'file_updated', { id, path: filePath, name: updatedName });
-
-  const rows = db.prepare('SELECT id, name, model, path, size, sha1, os, uploaded_at, download_count FROM files ORDER BY uploaded_at DESC').all();
-  const baseUrl = getManifestHost(req);
-  res.json(rows.map((row) => ({ ...row, os: JSON.parse(row.os), url: `${baseUrl}/files/${row.path}` })));
-});
-
-async function buildManifest(host) {
-  const excludePaladium = !!appConfig.exclude_paladium;
-  const blacklistedModelNames = new Set(getBlacklistedModels().map((item) => item.name));
-  const blacklistedFileKeys = new Set(getBlacklistedFiles().map((item) => `${item.model}::${item.path}`));
-  // Always start from remote manifest for models; when exclude_paladium is set,
-  // we will remove remote files only (leave remote models present).
-  const manifest = JSON.parse(JSON.stringify(remoteManifest));
-  manifest.models = (manifest.models || []).filter((item) => !blacklistedModelNames.has(item.name));
-  if (excludePaladium) {
-    // remove remote files entirely
-    manifest.files = [];
-  } else {
-    manifest.files = (manifest.files || []).filter((item) => !blacklistedFileKeys.has(`${item.model}::${item.path}`) && !blacklistedModelNames.has(item.model));
-  }
-
-  const models = db.prepare('SELECT name, version, description, dest, os FROM models ORDER BY created_at DESC').all().map((row) => ({
-    name: row.name,
-    version: row.version,
-    description: row.description,
-    dest: row.dest,
-    os: JSON.parse(row.os)
-  }));
-  const files = db.prepare('SELECT name, model, path, size, sha1, os FROM files ORDER BY uploaded_at DESC').all().map((row) => ({
-    name: row.name,
-    model: row.model,
-    url: `${host}/files/${row.path}`,
-    size: row.size,
-    sha1: row.sha1,
-    path: row.path,
-    os: JSON.parse(row.os)
-  }));
-
-  // Exclude any locally added models/files that are blacklisted
-  // Reuse `blacklistedModelNames` and `blacklistedFileKeys` declared above
-
-  const filteredLocalModels = models.filter((m) => !blacklistedModelNames.has(m.name));
-  const filteredLocalFiles = files.filter((f) => !blacklistedFileKeys.has(`${f.model}::${f.path}`) && !blacklistedModelNames.has(f.model));
-
-  manifest.models = [...manifest.models, ...filteredLocalModels];
-  manifest.files = [...manifest.files, ...filteredLocalFiles];
-  // Normalize file.path to be relative to model.dest when possible so files
-  // don't redundantly include the model destination in the manifest.
-  const modelDestByName = new Map((manifest.models || []).map((m) => [m.name, m.dest]));
-  manifest.files = (manifest.files || []).map((f) => {
-    try {
-      const dest = modelDestByName.get(f.model);
-      if (dest && typeof f.path === 'string' && f.path.startsWith(dest + '/')) {
-        return { ...f, path: f.path.slice(dest.length + 1) };
-      }
-    } catch (e) {
-      // ignore and return original
-    }
-    return f;
-  });
-  const manifestText = JSON.stringify(manifest, null, 2);
-  manifestCache = manifestText;
-  manifestCacheHost = host + `::exclude_paladium=${excludePaladium}`;
-  manifestCacheDirty = false;
-  await saveManifestCache(manifestText);
-  return manifestText;
-}
-
-app.get('/manifest.json', async (req, res) => {
-  if (!remoteManifest.models.length && !remoteManifest.files.length) {
-    await fetchRemoteManifest();
-  }
-  const host = getManifestHost(req);
-  const excludePaladium = !!appConfig.exclude_paladium;
-  const cacheKey = host + `::exclude_paladium=${excludePaladium}`;
-  if (!manifestCacheDirty && manifestCache && manifestCacheHost === cacheKey) {
-    res.setHeader('Content-Type', 'application/json');
-    return res.send(manifestCache);
-  }
-  const manifestText = await buildManifest(host);
-  res.setHeader('Content-Type', 'application/json');
-  res.send(manifestText);
-});
-
-app.get('/files/*', (req, res) => {
-  const relativeFile = req.params[0];
-  if (!relativeFile) return res.status(404).send('Not found');
-  const filePath = path.posix.normalize(relativeFile).replace(/^\.+/, '');
-  const fullPath = path.join(STORAGE_ROOT, filePath);
-  console.log('Serving file', fullPath);
-  if (!fullPath.startsWith(path.resolve(STORAGE_ROOT))) {
-    return res.status(400).json({ error: 'invalid file path' });
-  }
-  if (!fs.existsSync(fullPath)) {
-    logger('error', 'file_not_found_on_serve', { path: filePath, fullPath });
-    return res.status(404).json({ error: 'not found' });
-  }
-  db.prepare('UPDATE files SET download_count = download_count + 1 WHERE path = ?').run(filePath);
-  logger('info', 'file_served', { path: filePath });
-  res.sendFile(fullPath);
-});
-
-app.use(express.static(path.join(process.cwd(), 'dist')));
-app.get('*', (req, res) => {
-  res.sendFile(path.join(process.cwd(), 'dist', 'index.html'));
-});
-
-// Error handler to catch uncaught errors and log them
-app.use((err, req, res, next) => {
+app.get('/api/config', requireAuth, (_request, response) => response.json(catalog.config));
+app.post('/api/config', requireAuth, async (request, response, next) => {
   try {
-    logger('error', 'unhandled_error', { message: err?.message, stack: err?.stack, url: req?.originalUrl });
-  } catch (e) {
-    console.error('Failed logging error middleware', e.message);
-  }
-  if (!res.headersSent) {
-    res.status(500).json({ error: 'internal server error' });
-  }
+    if (typeof request.body?.exclude_paladium !== 'boolean') return response.status(400).json({ error: 'exclude_paladium must be a boolean.' });
+    catalog.config.exclude_paladium = request.body.exclude_paladium; await persist(); return response.json(catalog.config);
+  } catch (error) { next(error); }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server listening on http://localhost:${PORT}`);
-  console.log('Storage root:', STORAGE_ROOT);
-});
+app.get('/manifest.json', (request, response) => response.json(mergedManifest(request)));
+app.get('/files/*', async (request, response, next) => { try { response.sendFile(safeStoragePath(cleanPath(request.params[0]))); } catch (error) { next(error); } });
+app.use(express.static(path.join(process.cwd(), 'dist'), { index: false }));
+app.get('*', (_request, response) => response.sendFile(path.join(process.cwd(), 'dist', 'index.html')));
+app.use((error, _request, response, _next) => { console.error(error); response.status(error.code === 'LIMIT_FILE_SIZE' ? 413 : 400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'File is too large.' : error.message || 'Request failed.' }); });
+
+await initialise();
+await refreshRemoteManifest();
+setInterval(refreshRemoteManifest, 10 * 60 * 1000).unref();
+app.listen(port, () => console.log(`CDN Console listening on port ${port}`));

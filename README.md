@@ -1,39 +1,36 @@
-# Admin CDN
+# CDN Console
 
-Remarque : ce repo entier est vibecoded et susceptible d'être modifié.
+A small, self-hosted console for publishing release artifacts and a merged JSON manifest.
 
-Application simple Svelte + Express pour gérer les téléversements de fichiers et publier un manifeste combiné.
+## Run it
 
-## Fonctionnalités
-- Téléverser des fichiers et gérer les métadonnées
-- Créer des modèles (`name`, `version`, `description`, `dest`, `os`)
-- Servir les fichiers sous `/files/...`
-- Fournir `/manifest.json` en fusionnant le manifeste distant avec les modèles et fichiers locaux
-- Connexion administrateur via mot de passe dans `.env`
-- Support mode clair/sombre avec préférence du navigateur et bascule
+```sh
+cp .env.example .env
+# Set a strong ADMIN_PASSWORD in .env
+npm ci
+npm run build
+npm start
+```
+
+The application requires Node.js 20 or newer. Docker is the simplest production option:
+
+```sh
+docker compose up --build -d
+```
+
+The web console is available at `http://localhost:8080`. The public manifest is at `/manifest.json`; uploaded assets are available below `/files/`.
 
 ## Configuration
-1. Copier `.env.example` en `.env`
-2. Définir `ADMIN_PASSWORD`
-3. Exécuter `npm install`
-4. Exécuter `npm run build`
-5. Démarrer l'application avec `npm start`
 
-## Docker
-- `docker-compose up --build`
-- Les données sont stockées dans `./files` et montées sur `/app/files` dans le conteneur
-- Le conteneur utilise `restart: unless-stopped`
+| Variable | Required | Purpose |
+| --- | --- | --- |
+| `ADMIN_PASSWORD` | yes | Password for the console. |
+| `PORT` | no | HTTP port; defaults to `8080`. |
+| `STORAGE_ROOT` | no | Persistent files and catalog location; defaults to `./files`. |
+| `MANIFEST_BASE_URL` | no | Public URL to use in manifest file links. |
+| `REMOTE_MANIFEST_URL` | no | Upstream manifest; defaults to the Paladium CDN manifest. |
+| `MAX_UPLOAD_BYTES` | no | Upload limit; defaults to 1 GiB. |
+| `AUTH_SESSION_DAYS` | no | Remembered-login duration; defaults to 30 days and renews while in use. |
+| `SESSION_SECRET` | no | Extra secret for login cookies; changing it signs every user out. |
 
-## API
-- `POST /api/login` `{ password }`
-- `POST /api/logout`
-- `GET /api/models`
-- `POST /api/models`
-- `GET /api/files`
-- `POST /api/files` (upload multipart)
-- `GET /manifest.json`
-
-## Remarques
-- Le manifeste CDN distant est mis en cache sur le disque dans le volume de stockage et est rafraîchi toutes les 10 minutes.
-- Si `.env` ne définit pas `ADMIN_PASSWORD`, le serveur se termine immédiatement.
-- Les accès API non authentifiés renvoient des erreurs JSON.
+The local catalog is atomically written to `catalog.json` inside `STORAGE_ROOT`. Keep that directory mounted as a persistent volume.
