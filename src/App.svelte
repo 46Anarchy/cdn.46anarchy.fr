@@ -160,6 +160,16 @@
     } finally { busy = false; }
   }
 
+  async function regenerateManifest() {
+    if (!confirm('Regenerate the manifest from the files on disk? Catalog entries for missing files will be removed.')) return;
+    busy = true;
+    try {
+      const result = await request('/api/files/regenerate', { method: 'POST' });
+      await load();
+      message(`Manifest regenerated: ${result.repaired} file${result.repaired === 1 ? '' : 's'} repaired${result.removed ? `, ${result.removed} missing entr${result.removed === 1 ? 'y' : 'ies'} removed` : ''}.`);
+    } catch (err) { fail(err); } finally { busy = false; }
+  }
+
   async function removeFile(file) {
     if (!confirm(`Delete ${file.name}?`)) return;
     busy = true;
@@ -282,6 +292,7 @@
         <div class="card-heading"><div><p class="eyebrow">PUBLISHING</p><h2>Manifest sources</h2></div></div>
         <p class="muted">Your uploaded files are always included in <code>/manifest.json</code>.</p>
         <label class="switch"><input type="checkbox" bind:checked={config.exclude_paladium} on:change={updateConfig} disabled={busy} /><span></span><b>Exclude Paladium CDN files</b></label>
+        <button class="secondary" on:click={regenerateManifest} disabled={busy}>Regenerate manifest</button>
       </section>
     </div>
 

@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import express from 'express';
 import dotenv from 'dotenv';
+import { createReadStream } from 'fs';
 import fs from 'fs/promises';
 import multer from 'multer';
 import path from 'path';
@@ -78,7 +79,27 @@ function requireAuth(request, response, next) {
 
 function publicFile(file, request) {
   const host = process.env.MANIFEST_BASE_URL || `${request.protocol}://${request.get('host')}`;
-  return { ...file, url: `${host.replace(/\/$/, '')}/files/${encodeURI(file.path)}` };
+  const { storage_path, ...manifestFile } = file;
+  return { ...manifestFile, url: `${host.replace(/\/$/, '')}/files/${encodeURI(storage_path || file.path)}` };
+}
+
+function storagePathFor(file) {
+  return cleanPath(file.storage_path || file.path);
+}
+
+function manifestPathFor(storagePath, model) {
+  const destination = cleanPath(model.dest);
+  return storagePath.startsWith(`${destination}/`) ? storagePath.slice(destination.length + 1) : storagePath;
+}
+
+async function sha1ForFile(filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha1');
+    const stream = createReadStream(filePath);
+    stream.on('data', (chunk) => hash.update(chunk));
+    stream.once('error', reject);
+    stream.once('end', () => resolve(hash.digest('hex')));
+  });
 }
 
 // Remote model definitions are useful on their own: they define the destination
@@ -217,7 +238,7 @@ app.delete('/api/models/:name', requireAuth, async (request, response, next) => 
     const affectedFiles = catalog.files.filter((file) => file.model === model.name);
     catalog.files = catalog.files.filter((file) => file.model !== model.name);
     catalog.blacklist.models = catalog.blacklist.models.filter((item) => item.name !== model.name);
-    await Promise.all(affectedFiles.map((file) => fs.unlink(safeStoragePath(file.path)).catch((error) => { if (error.code !== 'ENOENT') throw error; })));
+    await Promise.all(affectedFiles.map((file) => fs.unlink(safeStoragePath(storagePathFor(file))).catch((error) => { if (error.code !== 'ENOENT') throw error; })));
     await persist(); return response.json({ success: true, deletedFiles: affectedFiles.length });
   } catch (error) { next(error); }
 });
@@ -226,14 +247,15 @@ app.get('/api/files', requireAuth, (request, response) => response.json(catalog.
 async function saveUploadedFiles(model, uploads) {
   const stored = uploads.map(({ file: uploadedFile, relative }) => {
     const cleanRelative = cleanPath(relative);
-    const filePath = cleanPath(path.posix.join(model.dest, cleanRelative));
+    const storagePath = cleanPath(path.posix.join(model.dest, cleanRelative));
     return {
       uploadedFile,
       file: {
         id: crypto.randomUUID(),
         name: path.posix.basename(cleanRelative),
         model: model.name,
-        path: filePath,
+        path: cleanRelative,
+        storage_path: storagePath,
         size: uploadedFile.size,
         sha1: crypto.createHash('sha1').update(uploadedFile.buffer).digest('hex'),
         os: model.os,
@@ -244,17 +266,17 @@ async function saveUploadedFiles(model, uploads) {
 
   const paths = new Set();
   for (const { file } of stored) {
-    if (paths.has(file.path)) throw new Error('The upload contains more than one file for the same path.');
-    paths.add(file.path);
+    if (paths.has(file.storage_path)) throw new Error('The upload contains more than one file for the same path.');
+    paths.add(file.storage_path);
   }
 
   for (const { uploadedFile, file } of stored) {
-    const destination = safeStoragePath(file.path);
+    const destination = safeStoragePath(file.storage_path);
     await fs.mkdir(path.dirname(destination), { recursive: true });
     await fs.writeFile(destination, uploadedFile.buffer);
   }
 
-  catalog.files = catalog.files.filter((item) => !paths.has(item.path) || item.model !== model.name);
+  catalog.files = catalog.files.filter((item) => !paths.has(storagePathFor(item)) || item.model !== model.name);
   catalog.files.push(...stored.map(({ file }) => file));
   await persist();
   return stored.map(({ file }) => file);
@@ -270,13 +292,53 @@ app.post('/api/files', requireAuth, upload.single('file'), async (request, respo
     return response.status(201).json(publicFile(file, request));
   } catch (error) { next(error); }
 });
+app.post('/api/files/regenerate', requireAuth, async (_request, response, next) => {
+  try {
+    const models = new Map(availableModels().map((model) => [model.name, model]));
+    const repairedPaths = new Map();
+    const repaired = [];
+    let removed = 0;
+
+    for (const file of catalog.files) {
+      const model = models.get(file.model);
+      if (!model) { removed += 1; continue; }
+      const storagePath = storagePathFor(file);
+      try {
+        const stats = await fs.stat(safeStoragePath(storagePath));
+        if (!stats.isFile()) { removed += 1; continue; }
+        const manifestPath = manifestPathFor(storagePath, model);
+        repairedPaths.set(`${file.model}:${file.path}`, `${file.model}:${manifestPath}`);
+        repaired.push({
+          ...file,
+          name: path.posix.basename(manifestPath),
+          path: manifestPath,
+          storage_path: storagePath,
+          size: stats.size,
+          sha1: await sha1ForFile(safeStoragePath(storagePath)),
+          os: normaliseOs(model.os)
+        });
+      } catch (error) {
+        if (error.code === 'ENOENT') { removed += 1; continue; }
+        throw error;
+      }
+    }
+
+    catalog.files = repaired;
+    catalog.blacklist.files = catalog.blacklist.files.map((item) => {
+      const repairedKey = repairedPaths.get(`${item.model}:${item.path}`);
+      return repairedKey ? { ...item, path: repairedKey.slice(item.model.length + 1) } : item;
+    });
+    await persist();
+    return response.json({ repaired: repaired.length, removed });
+  } catch (error) { next(error); }
+});
 app.put('/api/files/:id', requireAuth, upload.single('file'), async (request, response, next) => {
   try {
     if (!request.file) return response.status(400).json({ error: 'Choose a replacement file.' });
     const index = catalog.files.findIndex((file) => file.id === request.params.id);
     if (index < 0) return response.status(404).json({ error: 'File not found.' });
     const existing = catalog.files[index];
-    await fs.writeFile(safeStoragePath(existing.path), request.file.buffer);
+    await fs.writeFile(safeStoragePath(storagePathFor(existing)), request.file.buffer);
     const file = {
       ...existing,
       size: request.file.size,
@@ -293,7 +355,7 @@ app.delete('/api/files/:id', requireAuth, async (request, response, next) => {
     const index = catalog.files.findIndex((file) => file.id === request.params.id);
     if (index < 0) return response.status(404).json({ error: 'File not found.' });
     const [file] = catalog.files.splice(index, 1);
-    await fs.unlink(safeStoragePath(file.path)).catch((error) => { if (error.code !== 'ENOENT') throw error; });
+    await fs.unlink(safeStoragePath(storagePathFor(file))).catch((error) => { if (error.code !== 'ENOENT') throw error; });
     await persist(); return response.json({ success: true });
   } catch (error) { next(error); }
 });
