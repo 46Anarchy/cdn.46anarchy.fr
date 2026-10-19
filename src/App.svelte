@@ -14,6 +14,7 @@
   let modelForm = { ...emptyModel };
   let editingModel = null;
   let upload = { model: '', path: '', file: null };
+  let batchUpload = { model: '', files: [] };
 
   const request = async (url, options = {}) => {
     const response = await fetch(url, options);
@@ -114,6 +115,34 @@
     } catch (err) { fail(err); } finally { busy = false; }
   }
 
+  function folderRelativePath(file) {
+    const selectedPath = String(file.webkitRelativePath || file.name).replace(/\\/g, '/');
+    const firstSlash = selectedPath.indexOf('/');
+    return firstSlash === -1 ? selectedPath : selectedPath.slice(firstSlash + 1);
+  }
+
+  function chooseDirectory(event) {
+    batchUpload = { ...batchUpload, files: Array.from(event.currentTarget.files || []) };
+  }
+
+  async function uploadDirectory() {
+    if (!batchUpload.files.length) return fail(new Error('Choose a directory to upload.'));
+    busy = true;
+    try {
+      const body = new FormData();
+      body.append('model', batchUpload.model);
+      for (const file of batchUpload.files) {
+        body.append('files', file);
+        body.append('paths', folderRelativePath(file));
+      }
+      const result = await request('/api/files/batch', { method: 'POST', body });
+      batchUpload = { model: '', files: [] };
+      document.querySelector('#directory-input').value = '';
+      await load();
+      message(`${result.uploaded} file${result.uploaded === 1 ? '' : 's'} uploaded.`);
+    } catch (err) { fail(err); } finally { busy = false; }
+  }
+
   async function removeFile(file) {
     if (!confirm(`Delete ${file.name}?`)) return;
     busy = true;
@@ -183,6 +212,18 @@
             <label class="wide">Relative path <span>(optional)</span><input bind:value={upload.path} placeholder="mods/example.jar" /></label>
             <label class="wide file-picker">Select file<input id="file-input" type="file" required on:change={(event) => upload = { ...upload, file: event.target.files[0] }} /><small>{upload.file ? upload.file.name : 'No file selected'}</small></label>
             <button class="wide" disabled={busy}>Upload file</button>
+          </form>
+        {/if}
+      </section>
+
+      <section class="card">
+        <div class="card-heading"><div><p class="eyebrow">03</p><h2>Upload a directory</h2></div></div>
+        {#if models.length === 0}<p class="muted">Create a model before uploading a directory.</p>{:else}
+          <form on:submit|preventDefault={uploadDirectory} class="form-grid">
+            <label class="wide">Model<select bind:value={batchUpload.model} required><option value="">Choose a model</option>{#each models as model}<option value={model.name}>{model.name} · {model.version}{model.source === 'paladium' ? ' · Paladium' : ''}</option>{/each}</select></label>
+            <label class="wide file-picker">Select directory<input id="directory-input" type="file" webkitdirectory directory required on:change={chooseDirectory} /><small>{batchUpload.files.length ? `${batchUpload.files.length} file${batchUpload.files.length === 1 ? '' : 's'} selected` : 'No directory selected'}</small></label>
+            <p class="wide muted">Files are placed relative to the chosen directory. For example, <code>mods/fr/paladium/zephyr.jar</code> is uploaded as <code>fr/paladium/zephyr.jar</code> inside this model’s destination.</p>
+            <button class="wide" disabled={busy}>Upload directory</button>
           </form>
         {/if}
       </section>

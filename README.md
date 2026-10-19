@@ -34,3 +34,7 @@ The web console is available at `http://localhost:8080`. The public manifest is 
 | `SESSION_SECRET` | no | Extra secret for login cookies; changing it signs every user out. |
 
 The local catalog is atomically written to `catalog.json` inside `STORAGE_ROOT`. Keep that directory mounted as a persistent volume.
+
+## Directory uploads
+
+The console can upload an entire directory recursively. Choose the model first, then select a directory. Every file is stored beneath that model's destination using its path relative to the selected directory; the selected directory name itself is not included. For example, selecting `mods` uploads `mods/fr/paladium/zephyr.jar` to `<model destination>/fr/paladium/zephyr.jar`.

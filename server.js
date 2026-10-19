@@ -223,20 +223,63 @@ app.delete('/api/models/:name', requireAuth, async (request, response, next) => 
 });
 
 app.get('/api/files', requireAuth, (request, response) => response.json(catalog.files.slice().sort((a, b) => b.uploaded_at.localeCompare(a.uploaded_at)).map((file) => publicFile(file, request))));
+async function saveUploadedFiles(model, uploads) {
+  const stored = uploads.map(({ file: uploadedFile, relative }) => {
+    const cleanRelative = cleanPath(relative);
+    const filePath = cleanPath(path.posix.join(model.dest, cleanRelative));
+    return {
+      uploadedFile,
+      file: {
+        id: crypto.randomUUID(),
+        name: path.posix.basename(cleanRelative),
+        model: model.name,
+        path: filePath,
+        size: uploadedFile.size,
+        sha1: crypto.createHash('sha1').update(uploadedFile.buffer).digest('hex'),
+        os: model.os,
+        uploaded_at: new Date().toISOString()
+      }
+    };
+  });
+
+  const paths = new Set();
+  for (const { file } of stored) {
+    if (paths.has(file.path)) throw new Error('The upload contains more than one file for the same path.');
+    paths.add(file.path);
+  }
+
+  for (const { uploadedFile, file } of stored) {
+    const destination = safeStoragePath(file.path);
+    await fs.mkdir(path.dirname(destination), { recursive: true });
+    await fs.writeFile(destination, uploadedFile.buffer);
+  }
+
+  catalog.files = catalog.files.filter((item) => !paths.has(item.path) || item.model !== model.name);
+  catalog.files.push(...stored.map(({ file }) => file));
+  await persist();
+  return stored.map(({ file }) => file);
+}
+
 app.post('/api/files', requireAuth, upload.single('file'), async (request, response, next) => {
   try {
     if (!request.file) return response.status(400).json({ error: 'Choose a file to upload.' });
     const model = availableModels().find((item) => item.name === request.body.model);
     if (!model) return response.status(400).json({ error: 'Choose an existing model.' });
     const relative = request.body.path ? cleanPath(request.body.path) : cleanPath(request.file.originalname);
-    const filePath = cleanPath(path.posix.join(model.dest, relative));
-    const destination = safeStoragePath(filePath);
-    await fs.mkdir(path.dirname(destination), { recursive: true });
-    await fs.writeFile(destination, request.file.buffer);
-    const previous = catalog.files.findIndex((item) => item.model === model.name && item.path === filePath);
-    if (previous >= 0) catalog.files.splice(previous, 1);
-    const file = { id: crypto.randomUUID(), name: path.posix.basename(relative), model: model.name, path: filePath, size: request.file.size, sha1: crypto.createHash('sha1').update(request.file.buffer).digest('hex'), os: model.os, uploaded_at: new Date().toISOString() };
-    catalog.files.push(file); await persist(); return response.status(201).json(publicFile(file, request));
+    const [file] = await saveUploadedFiles(model, [{ file: request.file, relative }]);
+    return response.status(201).json(publicFile(file, request));
+  } catch (error) { next(error); }
+});
+app.post('/api/files/batch', requireAuth, upload.array('files'), async (request, response, next) => {
+  try {
+    const uploadedFiles = request.files || [];
+    if (!uploadedFiles.length) return response.status(400).json({ error: 'Choose a directory containing files to upload.' });
+    const model = availableModels().find((item) => item.name === request.body.model);
+    if (!model) return response.status(400).json({ error: 'Choose an existing model.' });
+    const relativePaths = Array.isArray(request.body.paths) ? request.body.paths : [request.body.paths];
+    if (relativePaths.length !== uploadedFiles.length) return response.status(400).json({ error: 'Each uploaded file must include a relative path.' });
+    const files = await saveUploadedFiles(model, uploadedFiles.map((file, index) => ({ file, relative: relativePaths[index] })));
+    return response.status(201).json({ uploaded: files.length, files: files.map((file) => publicFile(file, request)) });
   } catch (error) { next(error); }
 });
 app.delete('/api/files/:id', requireAuth, async (request, response, next) => {
