@@ -270,18 +270,6 @@ app.post('/api/files', requireAuth, upload.single('file'), async (request, respo
     return response.status(201).json(publicFile(file, request));
   } catch (error) { next(error); }
 });
-app.post('/api/files/batch', requireAuth, upload.array('files'), async (request, response, next) => {
-  try {
-    const uploadedFiles = request.files || [];
-    if (!uploadedFiles.length) return response.status(400).json({ error: 'Choose a directory containing files to upload.' });
-    const model = availableModels().find((item) => item.name === request.body.model);
-    if (!model) return response.status(400).json({ error: 'Choose an existing model.' });
-    const relativePaths = Array.isArray(request.body.paths) ? request.body.paths : [request.body.paths];
-    if (relativePaths.length !== uploadedFiles.length) return response.status(400).json({ error: 'Each uploaded file must include a relative path.' });
-    const files = await saveUploadedFiles(model, uploadedFiles.map((file, index) => ({ file, relative: relativePaths[index] })));
-    return response.status(201).json({ uploaded: files.length, files: files.map((file) => publicFile(file, request)) });
-  } catch (error) { next(error); }
-});
 app.delete('/api/files/:id', requireAuth, async (request, response, next) => {
   try {
     const index = catalog.files.findIndex((file) => file.id === request.params.id);

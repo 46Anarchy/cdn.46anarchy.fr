@@ -2,6 +2,10 @@
 
 A small, self-hosted console for publishing release artifacts and a merged JSON manifest.
 
+# Generative AI disclosure
+
+this application is 100% vibecoded and is in no way reflective of the 46anarchy team's skill. This is a quick and dirty thing we needed for the big thing to properly work.
+
 ## Run it
 
 ```sh
@@ -37,4 +41,4 @@ The local catalog is atomically written to `catalog.json` inside `STORAGE_ROOT`.
 
 ## Directory uploads
 
-The console can upload an entire directory recursively. Choose the model first, then select a directory. Every file is stored beneath that model's destination using its path relative to the selected directory; the selected directory name itself is not included. For example, selecting `mods` uploads `mods/fr/paladium/zephyr.jar` to `<model destination>/fr/paladium/zephyr.jar`.
+The console can upload an entire directory recursively. Choose the model first, then select a directory. Every file is sent in its own request, avoiding a combined request-size limit such as Cloudflare's. Every file is stored beneath that model's destination using its path relative to the selected directory; the selected directory name itself is not included. For example, selecting `mods` uploads `mods/fr/paladium/zephyr.jar` to `<model destination>/fr/paladium/zephyr.jar`. Each individual file must still be within the proxy's upload limit.
