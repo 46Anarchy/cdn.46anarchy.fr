@@ -14,7 +14,7 @@
   let modelForm = { ...emptyModel };
   let editingModel = null;
   let upload = { model: '', path: '', file: null };
-  let batchUpload = { model: '', files: [] };
+  let batchUpload = { model: '', files: [], root: '' };
   let directoryUploadProgress = null;
   let fileSearch = '';
   let fileSort = 'name';
@@ -120,14 +120,15 @@
     } catch (err) { fail(err); } finally { busy = false; }
   }
 
-  function folderRelativePath(file) {
+  function folderRelativePath(file, root) {
     const selectedPath = String(file.webkitRelativePath || file.name).replace(/\\/g, '/');
-    const firstSlash = selectedPath.indexOf('/');
-    return firstSlash === -1 ? selectedPath : selectedPath.slice(firstSlash + 1);
+    return root && selectedPath.startsWith(`${root}/`) ? selectedPath.slice(root.length + 1) : selectedPath;
   }
 
   function chooseDirectory(event) {
-    batchUpload = { ...batchUpload, files: Array.from(event.currentTarget.files || []) };
+    const selectedFiles = Array.from(event.currentTarget.files || []);
+    const firstPath = String(selectedFiles[0]?.webkitRelativePath || '').replace(/\\/g, '/');
+    batchUpload = { ...batchUpload, files: selectedFiles, root: firstPath.split('/')[0] || '' };
     directoryUploadProgress = null;
   }
 
@@ -135,6 +136,7 @@
     if (!batchUpload.files.length) return fail(new Error('Choose a directory to upload.'));
     const selectedModel = batchUpload.model;
     const selectedFiles = batchUpload.files;
+    const selectedRoot = batchUpload.root;
     busy = true;
     directoryUploadProgress = { completed: 0, total: selectedFiles.length };
     try {
@@ -143,11 +145,11 @@
         const body = new FormData();
         body.append('model', selectedModel);
         body.append('file', file);
-        body.append('path', folderRelativePath(file));
+        body.append('path', folderRelativePath(file, selectedRoot));
         await request('/api/files', { method: 'POST', body });
         directoryUploadProgress = { completed: index + 1, total: selectedFiles.length };
       }
-      batchUpload = { model: '', files: [] };
+      batchUpload = { model: '', files: [], root: '' };
       document.querySelector('#directory-input').value = '';
       await load();
       message(`${directoryUploadProgress.total} file${directoryUploadProgress.total === 1 ? '' : 's'} uploaded.`);
@@ -270,7 +272,7 @@
           <form on:submit|preventDefault={uploadDirectory} class="form-grid">
             <label class="wide">Model<select bind:value={batchUpload.model} required><option value="">Choose a model</option>{#each models as model}<option value={model.name}>{model.name} · {model.version}{model.source === 'paladium' ? ' · Paladium' : ''}</option>{/each}</select></label>
             <label class="wide file-picker">Select directory<input id="directory-input" type="file" webkitdirectory directory required on:change={chooseDirectory} /><small>{directoryUploadProgress ? `Uploading ${directoryUploadProgress.completed} of ${directoryUploadProgress.total} files…` : batchUpload.files.length ? `${batchUpload.files.length} file${batchUpload.files.length === 1 ? '' : 's'} selected` : 'No directory selected'}</small></label>
-            <p class="wide muted">Files are placed relative to the chosen directory. For example, <code>mods/fr/paladium/zephyr.jar</code> is uploaded as <code>fr/paladium/zephyr.jar</code> inside this model’s destination.</p>
+            <p class="wide muted">Files are placed relative to the chosen directory. For example, selecting <code>mods</code> uploads <code>mods/example.jar</code> as <code>example.jar</code> inside this model’s destination.</p>
             <button class="wide" disabled={busy}>Upload directory</button>
           </form>
         {/if}
